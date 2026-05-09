@@ -2,23 +2,20 @@
 
 Standalone EEPROM-side app source for Team RobotMad HexDrive2 boards.
 
-This repository starts from the current BadgeBot `EEPROM/hexdrive.py` implementation, renamed to `hexdrive2.py`, so that BadgeBot and HexManager can consume the same HexDrive2 source as a submodule instead of carrying separate copies.
-
 ## What This Repo Contains
 
 - `hexdrive2.py`: the MicroPython app that is compiled to `.mpy`, copied onto a hexpansion EEPROM, and run by BadgeOS as `app.mpy`.
 
-The exported runtime class remains `HexDriveApp`; only the source filename has changed.
+The exported runtime class is `HexDriveApp`.
 
 ## Current Scope
 
 The current implementation is the BadgeBot-derived HexDrive app with support for:
 
-- HexDrive v1 and HexDrive2 EEPROM detection.
+- HexDrive2 EEPROM detection.
 - Motor-only, servo-only, mixed motor/servo, and uncommitted HexDrive variants.
-- Hardware-specific servo pin remapping for HexDrive2 variants.
 - Keep-alive shutdown to de-energise outputs if updates stop arriving.
-- HexDrive2-only helper controls for the distance-sensor XSHUT pin and sensor LED.
+- HexDrive2 helper controls for the distance-sensor XSHUT pin and sensor LED.
 
 ## Building
 
@@ -45,10 +42,8 @@ The current `HexDriveApp` implementation exposes these control methods:
 
 ## Behaviour Notes
 
-- The code does **not** currently provide the old `set_pwm()` helper that some earlier BadgeBot documentation mentioned.
 - PWM outputs are allocated lazily so unused channels do not consume PWM resources.
 - The keep-alive watchdog is refreshed by `set_motors()` and `set_servoposition()` updates.
-- Calls to `set_dist_xshut()` and `set_sensor_led()` return `False` on older hardware that does not expose those lines.
 
 ## Intended Consumers
 
