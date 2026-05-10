@@ -1,25 +1,24 @@
 """HexDrive2 EEPROM app source shared between Team RobotMad apps."""
 
-# This is the app to be installed from a HexDrive or HexDrive2 Hexpansion EEPROM.
-# it is copied onto the EEPROM and renamed as app.py/mpy
+# This is the app to be installed from a HexDrive2 Hexpansion EEPROM.
+# it is compiled and copied onto the EEPROM as app.mpy
 # It is then run from the EEPROM by the BadgeOS.
 
 import ota
 from machine import PWM, Pin
 from system.eventbus import eventbus
 from system.hexpansion.config import HexpansionConfig
+from system.hexpansion import app as hexpansion_app
 from system.scheduler.events import RequestStopAppEvent
 import app
 from tildagon import Pin as ePin
 
 # Define the minimum BadgeOS version required to run this app (e.g. if we need features that are only available in a certain version of BadgeOS)
-_MIN_BADGEOS_VERSION = [1, 9, 0]     # v1.9.0 is required to be able to read the EEPROM with 16-bit addressing
+_MIN_BADGEOS_VERSION = [2, 0, 0]     # v2.0.0 is required to be able to use the new hexpansion utilites
 
 # HexDrive Hexpansion constants
 # Hardware defintions:
 _ENABLE_PIN  = 0     # First LS pin used to enable the SMPSU
-
-# Hardware Version 2
 _COLOUR_INT_PIN = 1  # Second LS pin used to detect interrupts from the colour sensor to trigger readings without polling
 _LED_PIN  = 2        # Third LS pin used to control an LED to illuminate the area under the colour sensor for better readings of reflected light from the surface below.
 _DIST_INT_PIN = 3    # Fourth LS pin used to detect interrupts from the distance sensor to trigger readings without polling
@@ -57,12 +56,9 @@ class HexDriveType:
         self.servo_pin_map: tuple[int, int, int, int] = servo_pins # Map the logical servo channels to the physical pin index according to hardware version
 
 _HEXDRIVE_TYPES = (
-    HexDriveType(0xC8, motors=2, servos=2, servo_pins=(3, 1, -1, -1)),  # uncommitted version (2) can be used for anything
+    HexDriveType(0xC8, motors=2, servos=2, servo_pins=(3, 1, -1, -1)),  # uncommitted version can be used for anything
     HexDriveType(0xC9, servos=2, name="2 Servo", servo_pins=(3, 1, -1, -1)),
     HexDriveType(0xCA, motors=2, name="2 Motor"),
-    HexDriveType(0xCB, motors=2, servos=4, servo_pins=(3, 2, 1, 0)),    # uncommitted version can be used for anything
-    HexDriveType(0xCC, servos=4, name="4 Servo", servo_pins=(3, 2, 1, 0)),
-    HexDriveType(0xCD, motors=1, servos=2, name="1 Mot 2 Srvo", servo_pins=(1, 0, -1, -1)),
     HexDriveType(0xCE, motors=1, name="1 Motor"),
     HexDriveType(0xCF, motors=1, servos=1, name="1 Mot 1 Srvo", servo_pins=(1, -1, -1, -1)),
 )
@@ -70,7 +66,7 @@ _HEXDRIVE_TYPES = (
 
 class HexDriveApp(app.App):         # pylint: disable=no-member
     """ HexDrive Hexpansion App for BadgeBot."""
-    VERSION = 7         # Increment this when making changes to the app that require the hexpansion app to be re-flashed with the new code.
+    VERSION = 1         # Increment this when making changes to the app that require the hexpansion app to be re-flashed with the new code.
 
     def __init__(self, config: HexpansionConfig | None = None):
         super().__init__()
@@ -86,20 +82,23 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             if ver >= _MIN_BADGEOS_VERSION:
                 pass
             else:
-                raise RuntimeError("HexDriveApp requires BadgeOS Upgrade")
+                print("HexDriveApp requires BadgeOS Upgrade")
+                return
         except Exception as e:      # pylint: disable=broad-except
             print(f"D:Ver check failed {e}!")
 
-        # read hexpansion header from EEPROM to find out which sub-type we are
-        _hexdrive_type, hw_ver = self._check_port_for_hexdrive(self.config.port)
-        if _hexdrive_type is None:
-            #print(f"D:{self.config.port}:Unknown HexDrive type - initialisation failed")
-            raise RuntimeError("Unknown HexDrive type")
-
-        self._hw_ver = hw_ver
+        try:
+            # read hexpansion header from EEPROM to find out which sub-type we are
+            _hexdrive_type = self._check_port_for_hexdrive(self.config.port)
+            if _hexdrive_type is None:
+                #print(f"D:{self.config.port}:Unknown HexDrive type - initialisation failed")
+                raise RuntimeError("Unknown HexDrive type")
+        except Exception as e:      # pylint: disable=broad-except
+            print(f"D:{self.config.port}:HexDrive type check failed {e}")
+            return    
 
         # report app starting and which port it is running on
-        print(f"D:HexDrive{'2' if 2 == self._hw_ver  else ''} Type:'{_hexdrive_type.name}' App V{self.VERSION} by RobotMad on port {self.config.port}")
+        print(f"D:HexDrive2 Type:'{_hexdrive_type.name}' App V{self.VERSION} by RobotMad on port {self.config.port}")
 
         self._hexdrive_type: HexDriveType = _hexdrive_type
         self._servo_pin_map: tuple[int, int, int, int] = self._hexdrive_type.servo_pin_map
@@ -114,9 +113,8 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 
         # LS Pins
         self._power_control: ePin = self.config.ls_pin[_ENABLE_PIN]
-        if self._hw_ver > 1:
-            self._led_control:   ePin = self.config.ls_pin[_LED_PIN]
-            self._dist_xshut:    ePin = self.config.ls_pin[_DIST_XSHUT_PIN]
+        self._led_control:   ePin = self.config.ls_pin[_LED_PIN]
+        self._dist_xshut:    ePin = self.config.ls_pin[_DIST_XSHUT_PIN]
 
         # Servo related
         self._servo_pin_map: tuple[int, int, int, int] = self._hexdrive_type.servo_pin_map
@@ -125,8 +123,8 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         eventbus.on_async(RequestStopAppEvent, self._handle_stop_app, self)
 
         if not self.initialise():
-            raise RuntimeError("HexDriveApp init failed")
-
+            print("HexDriveApp init failed")
+        
 
     def initialise(self) -> bool:
         """Initialise the app - return True if successful, False if failed."""
@@ -140,9 +138,8 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         # Initialise LS Pins
         try:
             self._power_control.init(mode=Pin.OUT)
-            if self._hw_ver > 1:
-                self._led_control.init(mode=Pin.OUT)
-                self._dist_xshut.init(mode=Pin.OUT)
+            self._led_control.init(mode=Pin.OUT)
+            self._dist_xshut.init(mode=Pin.OUT)
         except Exception as e:      # pylint: disable=broad-except
             print(f"D:{self.config.port}:ls_pin setup failed {e}")
             return False
@@ -175,26 +172,14 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         return True
 
 
-    def deinitialise(self) -> bool:
-        """ De-initialise the app - return True if successful, False if failed."""
-        # Turn off all PWM outputs & release resources
-        self.set_power(False)
-        self._pwm_deinit()
-        for hs_pin in self.config.pin:
-            hs_pin.init(mode=Pin.IN)
-        if self._hw_ver >= 1:
-            self._led_control.deinit()
-            self._dist_xshut.deinit()
-        return True
-
-
     async def _handle_stop_app(self, event):
         """ Handle the RequestStopAppEvent so that we can release resources """
         try:
             if event.app == self:
                 if self._logging:
                     print(f"D:{self.config.port}:Stop")
-                self.deinitialise()
+                self._pwm_deinit()
+                # The badge HexpansionManagerApp tidies up the LS and HS pins when a hexpansion app is removed
         except (AttributeError, TypeError):
             pass
 
@@ -249,8 +234,6 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 
     def set_dist_xshut(self, state: bool) -> bool:
         """ Set the state of the distance sensor XSHUT pin to power cycle it for reset or power saving. Returns success or failure. """
-        if self._hw_ver <= 1:
-            return False
         try:
             self._dist_xshut.init(mode=Pin.OUT)
             self._dist_xshut.value(state)
@@ -264,8 +247,6 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 
     def set_sensor_led(self, state: bool) -> bool:
         """ Set the state of the colour sensor LED pin to turn on or off the LED to illuminate the area under the colour sensor. Returns success or failure. """
-        if self._hw_ver <= 1:
-            return False
         try:
             self._led_control.init(mode=Pin.OUT)
             self._led_control.value(state)
@@ -547,21 +528,31 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         return True
 
 
-    def _check_port_for_hexdrive(self, port: int) -> tuple[HexDriveType | None, int]:
-        #just read the part of the header which contains the VID & PID
-        try:
-            vid_and_pid_bytes = self.config.i2c.readfrom_mem(_EEPROM_ADDR, _VID_ADDR, 4, addrsize = 8*_EEPROM_NUM_ADDRESS_BYTES)
-        except OSError as e:      # pylint: disable=broad-except
-            # no EEPROM on this port
-            print(f"D:{port}:EEPROM error: {e}")
-            return (None, 0)
+    def _check_port_for_hexdrive(self, port: int) -> HexDriveType | None:
+        if hexpansion_app is None:
+            if self._logging:
+                print(f"D:{port}:No hexpansion app found")
+            return None
+        manager = hexpansion_app._hexpansion_manager
+        if manager is None:
+            if self._logging:
+                print(f"D:{port}:No hexpansion manager found")
+            return None
+        headers = manager.hexpansion_headers
+        if headers[port] is None:
+            if self._logging:
+                print(f"D:{port}:No hexpansion header found")
+            return None
+        pid = headers[port].pid
+        print(f"D:{port}:PID={pid:#04x}")
+
         # check which type of HexDrive this is by scanning the HEXDRIVE_TYPES list
         for _, hexpansion_type in enumerate(_HEXDRIVE_TYPES):
             # we only use the LSByte of the PID to identify the type of HexDrive, as the MSByte is used for other things
-            if vid_and_pid_bytes[2] == hexpansion_type.pid:
-                return (hexpansion_type, 2 if vid_and_pid_bytes[:2] == b'\xCB\xCB' else 0)   # Hardware Version 2 if VID is 0xCBCB, otherwise Hardware Version 1
+            if pid & 0xFF == hexpansion_type.pid:
+                return hexpansion_type
         # we are not interested in this type of hexpansion
-        return (None, 0)
+        return None
 
 
     def _parse_version(self, version):
