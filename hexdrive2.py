@@ -95,7 +95,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 raise RuntimeError("Unknown HexDrive type")
         except Exception as e:      # pylint: disable=broad-except
             print(f"D:{self.config.port}:HexDrive type check failed {e}")
-            return    
+            return
 
         # report app starting and which port it is running on
         print(f"D:HexDrive2 Type:'{_hexdrive_type.name}' App V{self.VERSION} by RobotMad on port {self.config.port}")
@@ -124,7 +124,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 
         if not self.initialise():
             print("HexDriveApp init failed")
-        
+
 
     def initialise(self) -> bool:
         """Initialise the app - return True if successful, False if failed."""
@@ -202,7 +202,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                     try:
                         pwm.duty_u16(0)
                     except Exception as e:          # pylint: disable=broad-except
-                        #print(self._pwm_log_string(channel) + f"Off failed {e}")
+                        print(self._pwm_log_string(channel) + f"Off failed {e}")
                         self.PWMOutput[channel] = None  # Tidy Up
 
 
@@ -226,7 +226,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             self._power_control.init(mode=Pin.OUT)
             self._power_control.value(state)
         except Exception as e:      # pylint: disable=broad-except
-            #print(f"D:{self.config.port}:power control failed {e}")
+            print(f"D:{self.config.port}:power control failed {e}")
             return False
         self._power_state = state
         return True
@@ -241,7 +241,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 print(f"D:{self.config.port}:Distance Sensor XSHUT={'On' if state else 'Off'}")
             return True
         except Exception as e:      # pylint: disable=broad-except
-            #print(f"D:{self.config.port}:Distance Sensor XSHUT control failed {e}")
+            print(f"D:{self.config.port}:Distance Sensor XSHUT control failed {e}")
             return False
 
 
@@ -254,7 +254,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 print(f"D:{self.config.port}:Colour Sensor LED={'On' if state else 'Off'}")
             return True
         except Exception as e:      # pylint: disable=broad-except
-            #print(f"D:{self.config.port}:Colour Sensor LED control failed {e}")
+            print(f"D:{self.config.port}:Colour Sensor LED control failed {e}")
             return False
 
 
