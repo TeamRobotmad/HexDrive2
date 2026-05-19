@@ -515,7 +515,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             if self._logging:
                 print(f"D:{port}:No hexpansion app found")
             return _DEFAULT_HEXDRIVE_TYPE
-        if hasattr(hexpansion_app, "_hexpansion_manager") == False:
+        if not hasattr(hexpansion_app, "_hexpansion_manager"):
             if self._logging:
                 print(f"D:{port}:No _hexpansion_manager attribute found")
             return _DEFAULT_HEXDRIVE_TYPE
