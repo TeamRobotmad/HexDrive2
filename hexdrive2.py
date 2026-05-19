@@ -4,6 +4,12 @@
 # it is compiled and copied onto the EEPROM as app.mpy
 # It is then run from the EEPROM by the BadgeOS.
 
+try:
+    from micropython import const
+except ImportError:
+    # CPython / simulator fallback – const() is an identity function on MicroPython
+    const = lambda x: x  # noqa: E731
+
 import ota
 from machine import PWM, Pin
 from system.eventbus import eventbus
@@ -14,34 +20,34 @@ import app
 from tildagon import Pin as ePin
 
 # Define the minimum BadgeOS version required to run this app (e.g. if we need features that are only available in a certain version of BadgeOS)
-_MIN_BADGEOS_VERSION = [2, 0, 0]     # v2.0.0 is required to be able to use the new hexpansion utilites
+_MIN_BADGEOS_VERSION = [1, 12, 3]     # v1.12.3 is required to be able to use the new hexpansion utilites
 
 # HexDrive Hexpansion constants
 # Hardware defintions:
-_ENABLE_PIN  = 0     # First LS pin used to enable the SMPSU
-_COLOUR_INT_PIN = 1  # Second LS pin used to detect interrupts from the colour sensor to trigger readings without polling
-_LED_PIN  = 2        # Third LS pin used to control an LED to illuminate the area under the colour sensor for better readings of reflected light from the surface below.
-_DIST_INT_PIN = 3    # Fourth LS pin used to detect interrupts from the distance sensor to trigger readings without polling
-_DIST_XSHUT_PIN = 4  # Fifth LS pin used to control the XSHUT pin of the distance sensor to allow it to be power cycled for reset or power saving
+_ENABLE_PIN  = const(0)     # First LS pin used to enable the SMPSU
+_COLOUR_INT_PIN = const(1)  # Second LS pin used to detect interrupts from the colour sensor to trigger readings without polling
+_LED_PIN  = const(2)        # Third LS pin used to control an LED to illuminate the area under the colour sensor for better readings of reflected light from the surface below.
+_DIST_INT_PIN = const(3)    # Fourth LS pin used to detect interrupts from the distance sensor to trigger readings without polling
+_DIST_XSHUT_PIN = const(4)  # Fifth LS pin used to control the XSHUT pin of the distance sensor to allow it to be power cycled for reset or power saving
 
 # Default values and limits:
-_DEFAULT_PWM_FREQ = 20000           # 20kHz is a good default for motors as it is above the audible range for most people and works with most motors and ESCs
-_DEFAULT_SERVO_FREQ = 50            # 50Hz = 20mS period
-_DEFAULT_KEEP_ALIVE_PERIOD = 1000   # 1 second
-_MAX_NUM_CHANNELS = 4               # Max number of PWM channels supported by any type of HexDrive (Hexpansion limitation, not BadgeBot limit)
-_MAX_NUM_MOTORS = 2                 # Max number of motor channels supported by any type of HexDrive
+_DEFAULT_PWM_FREQ = const(20000)           # 20kHz is a good default for motors as it is above the audible range for most people and works with most motors and ESCs
+_DEFAULT_SERVO_FREQ = const(50)            # 50Hz = 20mS period
+_DEFAULT_KEEP_ALIVE_PERIOD = const(1000)   # 1 second
+_MAX_NUM_CHANNELS = const(4)               # Max number of PWM channels supported by any type of HexDrive (Hexpansion limitation, not BadgeBot limit)
+_MAX_NUM_MOTORS = const(2)                 # Max number of motor channels supported by any type of HexDrive
 
 # Servo Constants
-_MAX_SERVO_FREQ = 200               # 200Hz = 5mS period (can work with some Servos but not all)
-_SERVO_CENTRE    = 1500             # 1500us pulse width is the centre position for most RC servos (but some may be different, so we allow this to be trimmed)
-_MAX_SERVO_RANGE = 1400             # 1400us either side of centre (VERY WIDE)
-_SERVO_MAX_TRIM  = 1000             # 1000us either side of centre for trimming the centre position
+_MAX_SERVO_FREQ = const(200)               # 200Hz = 5mS period (can work with some Servos but not all)
+_SERVO_CENTRE    = const(1500)             # 1500us pulse width is the centre position for most RC servos (but some may be different, so we allow this to be trimmed)
+_MAX_SERVO_RANGE = const(1400)             # 1400us either side of centre (VERY WIDE)
+_SERVO_MAX_TRIM  = const(1000)             # 1000us either side of centre for trimming the centre position
 
 # EEPROM Constants
-_EEPROM_ADDR  = 0x50                # I2C address of the EEPROM on the HexDrive and HexSense Hexpansion
-_EEPROM_NUM_ADDRESS_BYTES = 2       # Number of bytes used for the memory address when reading from the EEPROM (e.g. 2 for 16-bit addressing)
-_VID_ADDR     = 0x10                # Address in the EEPROM where the Vendor ID (VID) byte is stored - used to identify the hardware version of the HexDrive
-_PID_ADDR     = 0x12                # Address in the EEPROM where the Product ID (PID) byte is stored - used to identify the type of Hexpansion
+_EEPROM_ADDR  = const(0x50)                # I2C address of the EEPROM on the HexDrive and HexSense Hexpansion
+_EEPROM_NUM_ADDRESS_BYTES = const(2)       # Number of bytes used for the memory address when reading from the EEPROM (e.g. 2 for 16-bit addressing)
+_VID_ADDR     = const(0x10)                # Address in the EEPROM where the Vendor ID (VID) byte is stored - used to identify the hardware version of the HexDrive
+_PID_ADDR     = const(0x12)                # Address in the EEPROM where the Product ID (PID) byte is stored - used to identify the type of Hexpansion
 
 
 class HexDriveType:
@@ -64,6 +70,8 @@ _HEXDRIVE_TYPES = (
 )
 
 
+_DEFAULT_HEXDRIVE_TYPE = _HEXDRIVE_TYPES[0]  # default to the uncommitted version if we can't read the EEPROM for some reason
+
 class HexDriveApp(app.App):         # pylint: disable=no-member
     """ HexDrive Hexpansion App for BadgeBot."""
     VERSION = 1         # Increment this when making changes to the app that require the hexpansion app to be re-flashed with the new code.
@@ -82,7 +90,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             if ver >= _MIN_BADGEOS_VERSION:
                 pass
             else:
-                print("HexDriveApp requires BadgeOS Upgrade")
+                print("D:HexDrive requires BadgeOS Upgrade")
                 return
         except Exception as e:      # pylint: disable=broad-except
             print(f"D:Ver check failed {e}!")
@@ -90,12 +98,9 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         try:
             # read hexpansion header from EEPROM to find out which sub-type we are
             _hexdrive_type = self._check_port_for_hexdrive(self.config.port)
-            if _hexdrive_type is None:
-                #print(f"D:{self.config.port}:Unknown HexDrive type - initialisation failed")
-                raise RuntimeError("Unknown HexDrive type")
         except Exception as e:      # pylint: disable=broad-except
             print(f"D:{self.config.port}:HexDrive type check failed {e}")
-            return
+            _hexdrive_type = _DEFAULT_HEXDRIVE_TYPE
 
         # report app starting and which port it is running on
         print(f"D:HexDrive2 Type:'{_hexdrive_type.name}' App V{self.VERSION} by RobotMad on port {self.config.port}")
@@ -299,25 +304,24 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                     # If frequency is set to 0 then we deinit the PWM to free up resources as much as possible
                     pwm.deinit()
                     self.PWMOutput[this_channel] = None
+                    self.config.pin[this_channel].init(mode=Pin.OUT)
                     self.config.pin[this_channel].value(0)
-                    #if self._logging:
-                    #    print(self._pwm_log_string(this_channel) + " disabled")
+                    if self._logging:
+                        print(self._pwm_log_string(this_channel) + " disabled")
                 else:
                     try:
                         pwm.freq(freq)
-                        #if self._logging:
-                        #    print(self._pwm_log_string(this_channel) + f"{freq}Hz set")
+                        if self._logging:
+                            print(self._pwm_log_string(this_channel) + f"{freq}Hz set")
                     except Exception as e:  # pylint: disable=broad-except
-                        #print(self._pwm_log_string(this_channel) + f"set freq {freq} failed {e}")
+                        print(self._pwm_log_string(this_channel) + f"set freq {freq} failed {e}")
                         return False
         return True
 
 
     def _pwm_log_string(self, channel: int | None) -> str:
         """ Helper method to generate a log string for a PWM output change. """
-        if channel is None:
-            return f"D:{self.config.port}:PWM:[All]:"
-        return f"D:{self.config.port}:PWM[{channel}]:"
+        return f"D:{self.config.port}:PWM[{channel if channel is not None else 'All'}]:"
 
 
     def set_servoposition(self, channel: int | None = None, position: int | None = None) -> bool:
@@ -447,16 +451,19 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 # switch off the currently active output before switching the other one on to prevent both outputs being on at the same time
                 pwm_to_disable = self.PWMOutput[output_to_disable]
                 if pwm_to_disable is not None:
-                    # we need to set the frequency of the output that is to be enabled to match the frequency of the output that is to be disabled
                     pwm_to_disable.deinit()
                     self.PWMOutput[output_to_disable] = None
-                    self.config.pin[output_to_disable].value(0)   # pin mapping necessary to match the physical channel numbering on the HexDrive Hexpansion
-                    #if self._logging:
-                    #    print(self._pwm_log_string(output_to_disable) + " disabled")
-                self._set_pwmoutput(output_to_enable, abs(output))
+                    print(f"D:{self.config.port}:pin{output_to_disable} = 0")
+                    self.config.pin[output_to_disable].init(mode=Pin.OUT)
+                    self.config.pin[output_to_disable].value(0)
+                    if self._logging:
+                        print(self._pwm_log_string(output_to_disable) + " disabled")
+                if 0 != output or self.PWMOutput[output_to_enable] is not None:
+                    # if output_to_enable is NOT already active and new output is 0 then we can leave it off for now.
+                    # otherwise we need to set the new output value
+                    self._set_pwmoutput(output_to_enable, abs(output))
             except Exception as e:          # pylint: disable=broad-except
-                #print(f"D:{self.config.port}:Motor{motor}:{output} set failed {e}")
-                pass
+                print(f"D:{self.config.port}:Motor{motor}:{output} set failed {e}")
             self._motor_output[motor] = output
             if output != 0:
                 self._outputs_energised = True
@@ -482,27 +489,6 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         self._pwm_setup = False
 
 
-    # using simpler tracking - which may leave us thinking the outputs are still energised when they have in fact
-    # all been turned off one at a time, but all this means is you would then get a spuriour Timeout if the
-    # keep alive isn't being refreshed by commands.
-
-    # are any of the PWM outputs energised?
-    #def _check_outputs_energised(self):
-    #    energised_output = False
-    #    for channel, pwm in enumerate(self.PWMOutput):
-    #        if pwm is not None:
-    #            try:
-    #                if 0 < pwm.duty_ns():
-    #                    energised_output = True
-    #                    break
-    #            except Exception as e:        # pylint: disable=broad-except
-    #                print(self._pwm_log_string(channel) + f"Check failed {e}")
-    #    if self._outputs_energised != energised_output:
-    #        if self._logging:
-    #            print(f"D:{self.config.port}:Outputs {'Energised' if energised_output else 'De-energised'}")
-    #        self._outputs_energised = energised_output
-
-
     # Set a single PWM duty cycle (0-65535) for a specific MOTOR output
     # if the channel has not been setup yet then we initialise it from scratch, otherwise we just change the duty cycle
     def _set_pwmoutput(self, _channel: int, _duty_cycle: int) -> bool:
@@ -512,37 +498,51 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             if self.PWMOutput[_channel] is None:
                 # Channel hasn't been setup yet so we need to initialise it from scratch
                 pin = self.config.pin[_channel]
+                if self._logging:
+                    print(self._pwm_log_string(_channel) + f"{self.PWMOutput[_channel]} init ... pin={pin}")
+                # Micropython v1.28 generates a spurious warning when we try to initialise a PWM on a pin that was previously used.
+                # "W (557771) ledc: GPIO 47 is not usable, maybe conflict with others"
+                # workaround is to deinit the pin first or at least set it to an input
+                if hasattr(pin, "deinit"):
+                    self.config.pin[_channel].deinit()
+                else:
+                    # only keep this code until v2.0 of badgeOS is released
+                    self.config.pin[_channel].init(mode=Pin.IN)
                 self.PWMOutput[_channel] = PWM(pin, freq = self._freq[_channel], duty_u16 = _duty_cycle)
-                #if self._logging:
-                #    print(self._pwm_log_string(_channel) + f"{self.PWMOutput[_channel]} init")
+                if self._logging:
+                    print(self._pwm_log_string(_channel) + f"{self.PWMOutput[_channel]} init")
             pwm = self.PWMOutput[_channel]
             if pwm is None:
                 return False
             if _duty_cycle != pwm.duty_u16():
                 pwm.duty_u16(_duty_cycle)
-            #if self._logging:
-            #    print(self._pwm_log_string(_channel) + f"{_duty_cycle}")
+                if self._logging:
+                    print(self._pwm_log_string(_channel) + f"{_duty_cycle}")
         except Exception as e:              # pylint: disable=broad-except
-            #print(self._pwm_log_string(_channel) + f"set {_duty_cycle} failed {e}")
+            print(self._pwm_log_string(_channel) + f"set {_duty_cycle} failed {e}")
             return False
         return True
 
 
-    def _check_port_for_hexdrive(self, port: int) -> HexDriveType | None:
+    def _check_port_for_hexdrive(self, port: int) -> HexDriveType:
         if hexpansion_app is None:
             if self._logging:
                 print(f"D:{port}:No hexpansion app found")
-            return None
+            return _DEFAULT_HEXDRIVE_TYPE
+        if hasattr(hexpansion_app, "_hexpansion_manager") == False:
+            if self._logging:
+                print(f"D:{port}:No _hexpansion_manager attribute found")
+            return _DEFAULT_HEXDRIVE_TYPE
         manager = hexpansion_app._hexpansion_manager
         if manager is None:
             if self._logging:
-                print(f"D:{port}:No hexpansion manager found")
-            return None
+                print(f"D:{port}:_hexpansion_manager is None")
+            return _DEFAULT_HEXDRIVE_TYPE
         headers = manager.hexpansion_headers
         if headers[port] is None:
             if self._logging:
                 print(f"D:{port}:No hexpansion header found")
-            return None
+            return _DEFAULT_HEXDRIVE_TYPE
         pid = headers[port].pid
         print(f"D:{port}:PID={pid:#04x}")
 
@@ -552,7 +552,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             if pid & 0xFF == hexpansion_type.pid:
                 return hexpansion_type
         # we are not interested in this type of hexpansion
-        return None
+        return _DEFAULT_HEXDRIVE_TYPE
 
 
     def _parse_version(self, version):
