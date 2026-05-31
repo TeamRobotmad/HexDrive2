@@ -362,7 +362,13 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 # Channel hasn't been setup yet so we need to initialise it from scratch
                 self._freq[channel] = self._freq[channel] if (0 < self._freq[channel]) and (self._freq[channel] <= _MAX_SERVO_FREQ) else _DEFAULT_SERVO_FREQ
                 try:
-                    self.PWMOutput[physical_channel] = PWM(self.config.pin[physical_channel], freq = self._freq[channel], duty_ns = pulse_width_in_ns)
+                    # Micropython v1.28 generates a spurious warning when we try to initialise a PWM on a pin that was previously used.
+                    # "W (557771) ledc: GPIO 47 is not usable, maybe conflict with others"
+                    # workaround is to set it to an input
+                    pin = self.config.pin[physical_channel]
+                    pin.init(mode=Pin.IN)
+                    self.PWMOutput[physical_channel] = PWM(pin, freq = self._freq[channel])
+                    self.PWMOutput[physical_channel].duty_ns(pulse_width_in_ns)
                     if self._logging:
                         print(self._pwm_log_string(physical_channel) + f"{self.PWMOutput[physical_channel]} init")
                 except Exception as e:      # pylint: disable=broad-except
@@ -491,13 +497,10 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                     print(self._pwm_log_string(_channel) + f"{self.PWMOutput[_channel]} init ... pin={pin}")
                 # Micropython v1.28 generates a spurious warning when we try to initialise a PWM on a pin that was previously used.
                 # "W (557771) ledc: GPIO 47 is not usable, maybe conflict with others"
-                # workaround is to deinit the pin first or at least set it to an input
-                if hasattr(pin, "deinit"):
-                    self.config.pin[_channel].deinit()
-                else:
-                    # only keep this code until v2.0 of badgeOS is released
-                    self.config.pin[_channel].init(mode=Pin.IN)
-                self.PWMOutput[_channel] = PWM(pin, freq = self._freq[_channel], duty_u16 = _duty_cycle)
+                # workaround is to set it to an input
+                pin.init(mode=Pin.IN)
+                self.PWMOutput[_channel] = PWM(pin, freq = self._freq[_channel])
+                self.PWMOutput[_channel].duty_u16(_duty_cycle)
                 if self._logging:
                     print(self._pwm_log_string(_channel) + f"{self.PWMOutput[_channel]} init")
             pwm = self.PWMOutput[_channel]
