@@ -109,7 +109,8 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         self._power_control: ePin = self.config.ls_pin[_ENABLE_PIN]
         self._led_control:   ePin = self.config.ls_pin[_LED_PIN]
         self._dist_xshut:    ePin = self.config.ls_pin[_DIST_XSHUT_PIN]
-
+        self._colour_int:    ePin = self.config.ls_pin[_COLOUR_INT_PIN]
+        self._dist_int:      ePin = self.config.ls_pin[_DIST_INT_PIN]
         # Servo related
         self._servo_pin_map: tuple[int, int, int, int] = self._hexdrive_type.servo_pin_map
         self._servo_centre: list[int] = [_SERVO_CENTRE] * self._hexdrive_type.servos
@@ -134,6 +135,8 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             self._power_control.init(mode=Pin.OUT)
             self._led_control.init(mode=Pin.OUT)
             self._dist_xshut.init(mode=Pin.OUT)
+            self._colour_int.init(mode=Pin.IN)
+            self._dist_int.init(mode=Pin.IN)
         except Exception as e:      # pylint: disable=broad-except
             print(f"D:{self.config.port}:ls_pin setup failed {e}")
             return False
@@ -519,7 +522,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             if self._logging:
                 print(f"D:{port}:No _hexpansion_manager attribute found")
             return _DEFAULT_HEXDRIVE_TYPE
-        manager = hexpansion_app._hexpansion_manager
+        manager = hexpansion_app._hexpansion_manager        # pylint: disable=protected-access
         if manager is None:
             if self._logging:
                 print(f"D:{port}:_hexpansion_manager is None")
