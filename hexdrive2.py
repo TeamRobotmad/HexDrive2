@@ -173,10 +173,25 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             if event.app == self:
                 if self._logging:
                     print(f"D:{self.config.port}:Stop")
-                self._pwm_deinit()
+                self.deinit()
                 # The badge HexpansionManagerApp tidies up the LS and HS pins when a hexpansion app is removed
         except (AttributeError, TypeError):
             pass
+
+
+    # Special function called by the BadgeOS to allow the app to clean up resources before it is removed from memory.
+    def deinit(self):
+        """ De-initialise all PWM outputs and free up resources. """
+        for _channel, _pwm in enumerate(self.PWMOutput):
+            if _pwm is not None:
+                try:
+                    _pwm.deinit()
+                except Exception:       # pylint: disable=broad-except
+                    pass
+                self.PWMOutput[_channel] = None
+        for _channel in range(_MAX_NUM_CHANNELS):
+            self._freq[_channel] = 0
+        self._pwm_setup = False
 
 
     def background_update(self, delta: int):
@@ -471,18 +486,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 # Private methods for internal use only.
 # --------------------------------------------------
 
-    # De-initialise all PWM outputs
-    def _pwm_deinit(self):
-        for _channel, _pwm in enumerate(self.PWMOutput):
-            if _pwm is not None:
-                try:
-                    _pwm.deinit()
-                except Exception:       # pylint: disable=broad-except
-                    pass
-                self.PWMOutput[_channel] = None
-        for _channel in range(_MAX_NUM_CHANNELS):
-            self._freq[_channel] = 0
-        self._pwm_setup = False
+
 
 
     # Set a single PWM duty cycle (0-65535) for a specific MOTOR output
