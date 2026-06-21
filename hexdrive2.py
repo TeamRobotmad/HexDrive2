@@ -20,7 +20,7 @@ import app
 from tildagon import Pin as ePin
 
 # Define the minimum BadgeOS version required to run this app (e.g. if we need features that are only available in a certain version of BadgeOS)
-_MIN_BADGEOS_VERSION = [1, 12, 3]     # v1.12.3 is required to be able to use the new hexpansion utilites
+_MIN_BADGEOS_VERSION = [2, 0, 0]     # v2.0.0 is required to be able to use the new hexpansion utilites
 
 # HexDrive Hexpansion constants
 # Hardware defintions:
@@ -68,7 +68,7 @@ _DEFAULT_HEXDRIVE_TYPE = _HEXDRIVE_TYPES[0]  # default to the uncommitted versio
 
 class HexDriveApp(app.App):         # pylint: disable=no-member
     """ HexDrive Hexpansion App for BadgeBot."""
-    VERSION = 1         # Increment this when making changes to the app that require the hexpansion app to be re-flashed with the new code.
+    VERSION = 1         # Increment this when making changes to the app that require the hexpansion EEPROM app to be re-flashed with the new code.
 
     def __init__(self, config: HexpansionConfig | None = None):
         super().__init__()
@@ -459,6 +459,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                     self._set_pwmoutput(output_to_enable, abs(output))
             except Exception as e:          # pylint: disable=broad-except
                 print(f"D:{self.config.port}:Motor{motor}:{output} set failed {e}")
+                return False
             self._motor_output[motor] = output
             if output != 0:
                 self._outputs_energised = True
