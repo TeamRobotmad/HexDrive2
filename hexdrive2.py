@@ -382,8 +382,9 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                     # workaround is to set it to an input
                     pin = self.config.pin[physical_channel]
                     pin.init(mode=Pin.IN)
-                    self.PWMOutput[physical_channel] = PWM(pin, freq = self._freq[channel])
-                    self.PWMOutput[physical_channel].duty_ns(pulse_width_in_ns)
+                    pwm = PWM(pin, freq = self._freq[channel])
+                    pwm.duty_ns(pulse_width_in_ns)
+                    self.PWMOutput[physical_channel] = pwm
                     if self._logging:
                         print(self._pwm_log_string(physical_channel) + f"{self.PWMOutput[physical_channel]} init")
                 except Exception as e:      # pylint: disable=broad-except
@@ -504,8 +505,9 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 # "W (557771) ledc: GPIO 47 is not usable, maybe conflict with others"
                 # workaround is to set it to an input
                 pin.init(mode=Pin.IN)
-                self.PWMOutput[_channel] = PWM(pin, freq = self._freq[_channel])
-                self.PWMOutput[_channel].duty_u16(_duty_cycle)
+                pwm = PWM(pin, freq = self._freq[_channel])
+                pwm.duty_u16(_duty_cycle)
+                self.PWMOutput[_channel] = pwm
                 if self._logging:
                     print(self._pwm_log_string(_channel) + f"{self.PWMOutput[_channel]} init")
             pwm = self.PWMOutput[_channel]
