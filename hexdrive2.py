@@ -3,15 +3,16 @@
 # This is the app to be installed from a HexDrive2 Hexpansion EEPROM.
 # it is compiled and copied onto the EEPROM as app.mpy
 # It is then run from the EEPROM by the BadgeOS.
-
+import time
 try:
     from micropython import const
 except ImportError:
     # CPython / simulator fallback – const() is an identity function on MicroPython
     const = lambda x: x  # noqa: E731
-
+import struct
 import ota
-from machine import PWM, Pin
+from machine import PWM, Pin, I2C
+from events import Event
 from system.eventbus import eventbus
 from system.hexpansion.config import HexpansionConfig
 from system.hexpansion import app as hexpansion_app
@@ -27,8 +28,25 @@ _MIN_BADGEOS_VERSION = [2, 0, 0]     # v2.0.0 is required to be able to use the 
 _ENABLE_PIN  = const(0)     # First LS pin used to enable the SMPSU
 _COLOUR_INT_PIN = const(1)  # Second LS pin used to detect interrupts from the colour sensor to trigger readings without polling
 _LED_PIN  = const(2)        # Third LS pin used to control an LED to illuminate the area under the colour sensor for better readings of reflected light from the surface below.
-_DIST_INT_PIN = const(3)    # Fourth LS pin used to detect interrupts from the distance sensor to trigger readings without polling
-_DIST_XSHUT_PIN = const(4)  # Fifth LS pin used to control the XSHUT pin of the distance sensor to allow it to be power cycled for reset or power saving
+_RANGE_INT_PIN = const(3)    # Fourth LS pin used to detect interrupts from the distance sensor to trigger readings without polling
+_RANGE_XSHUT_PIN = const(4)  # Fifth LS pin used to control the XSHUT pin of the distance sensor to allow it to be power cycled for reset or power saving
+_ALT_RANGE_INT_PIN = const(4) # Some models of the VL52L0X sensor module have the interrupt and XSHUT pins swapped (alternative pin for hardware versions that have the distance sensor on a different LS pin)
+_ALT_RANGE_XSHUT_PIN = const(3) # Some models of the VL52L0X sensor module have the interrupt and XSHUT pins swapped (alternative pin for hardware versions that have the distance sensor on a different LS pin)
+
+# Hexpansion EEPROM constants
+_ADDR_LEN = const(2)          # EEPROM I2C address length in bytes (1 or 2)
+_ADDR = const(0x50)           # EEPROM I2C address (7-bit)
+
+
+# EXTENDED Header constants
+_EXTENDED_HEADER_ADDR = const(0x30)  # EEPROM address of the extended header
+_EXTENDED_HEADER_SIZE = const(32)    # Size of the extended header in bytes
+_EXTENDED_HEADER_MAGIC = b"HDR2"            # Magic bytes to identify the extended header
+_EXTENDED_HEADER_VERSION = b"2026"          # Version of the extended header format
+
+# EXTENDED header flags constants
+_EXTENDED_HEADER_FLAG_INITIALISED = const(0x01)  # Flag indicating that the extended header has been initialised
+_EXTENDED_HEADER_FLAG_DIST_PINS_SWAPPED = const(0x02)  # Flag indicating that the distance sensor pins are swapped
 
 # Default values and limits:
 _DEFAULT_PWM_FREQ = const(20000)           # 20kHz is a good default for motors as it is above the audible range for most people and works with most motors and ESCs
@@ -66,9 +84,103 @@ _HEXDRIVE_TYPES = (
 
 _DEFAULT_HEXDRIVE_TYPE = _HEXDRIVE_TYPES[0]  # default to the uncommitted version if we can't read the EEPROM for some reason
 
+
+# --------------------------------------------------
+# Extended Hexpansion Header class for reading and writing the extended header of the hexpansion EEPROM.
+# This uses the fact that the standard Hexpansion header is 32 bytes long, and the extended header is
+# stored in the spare bytes of the first sector of the EEPROM. As we know that our EEPROMS use 64-byte pages.
+# --------------------------------------------------
+class ExtendedHexpansionHeader:
+    _header_format = "<4s4sI19s"
+    _magic = _EXTENDED_HEADER_MAGIC
+
+    def __init__(
+        self,
+        manifest_version: str = _EXTENDED_HEADER_VERSION.decode(),
+        flags: int = 0,
+        spare: str = "\x00" * 19
+        ):
+        self.manifest_version = manifest_version
+        self.flags: int = flags
+        self.spare: str = spare
+        self.to_bytes()
+
+    def __str__(self):
+        return f"""ExtendedHexpansionHeader[
+    manifest version: {self.manifest_version},
+    flags: {'0x' + hex(self.flags)[4:].upper()},
+    spare: {'0x' + hex(int.from_bytes(self.spare.encode(), 'little'))[2:].upper()}
+]"""
+
+    @classmethod
+    def calc_checksum(cls, b):
+        checksum = 0x55
+        for byte in b:
+            checksum ^= byte
+        return checksum
+
+    def to_bytes(self, include_checksum=True):
+        b = struct.pack(
+            self._header_format,
+            self._magic,
+            self.manifest_version,
+            self.flags,
+            self.spare
+        )
+        checksum = self.calc_checksum(b[1:])
+        return b + bytes([checksum])
+
+    @classmethod
+    def from_bytes(cls, buf, validate_checksum=True):
+        if len(buf) != _EXTENDED_HEADER_SIZE:
+            raise RuntimeError(f"Invalid extended header length, should be {_EXTENDED_HEADER_SIZE}")
+        if buf[0:4] != _EXTENDED_HEADER_MAGIC:
+            raise RuntimeError(f"Invalid magic in extended header: {buf[0:4]}")
+        if buf[4:8] != _EXTENDED_HEADER_VERSION:
+            raise RuntimeError(f"Unknown manifest version. Supported: [{_EXTENDED_HEADER_VERSION.decode()}]")
+        unpacked = struct.unpack(cls._header_format, buf)
+
+        if validate_checksum:
+            header_checksum = buf[_EXTENDED_HEADER_SIZE - 1]
+            bytes_checksum = cls.calc_checksum(buf[1:_EXTENDED_HEADER_SIZE - 1])
+            if header_checksum != bytes_checksum:
+                raise RuntimeError(
+                    f"Extended header checksum mismatch: {header_checksum} != {bytes_checksum}"
+                )
+
+        return cls(
+            manifest_version=unpacked[1].decode().split("\x00")[0],
+            flags=unpacked[2],
+            spare=unpacked[3],
+        )
+
+
+def _handle_range_interrupt(epin):
+    # Get range from sensor and emit event
+    # TODO - how do we access the HexDriveApp instance to get the range sensor object? We need to store a reference to the HexDriveApp instance somewhere so we can access it here.
+    # perhaps just call into a new method in the sensor class that can know how things are setup and hence what the interrupt was for - as may not always be a new range to be sent as an event?
+    sensor = ???
+    if sensor is None:
+        print("D:VL53L0X interrupt received but sensor is not initialised")
+        return
+    range = sensor.get_range()  # Get the range from the sensor
+    if range is not None:
+        eventbus.emit(HexDriveApp.RangeEvent(range))
+        print(f"D:VL53L0X interrupt received, range={range}mm")
+
+
 class HexDriveApp(app.App):         # pylint: disable=no-member
     """ HexDrive Hexpansion App for BadgeBot."""
     VERSION = 1         # Increment this when making changes to the app that require the hexpansion EEPROM app to be re-flashed with the new code.
+
+    class RangeEvent(Event):
+        """Emitted when a new ToF distance measurement is obtained, providing the distance to target in mm."""
+        def __init__(self, range: int):
+            self.range = range
+
+        def __str__(self):
+            return f"Range: {self.range}mm"
+
 
     def __init__(self, config: HexpansionConfig | None = None):
         super().__init__()
@@ -104,13 +216,26 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         self.PWMOutput: list[PWM | None] = [None] * _MAX_NUM_CHANNELS
         self._freq: list[int] = [0] * _MAX_NUM_CHANNELS
         self._motor_output: list[int] = [0] * self._hexdrive_type.motors
+        self._i2c: I2C | None = None
+        self._extended_header: ExtendedHexpansionHeader = self._read_extended_hexpansion_header()
+        if self._extended_header.flags & _EXTENDED_HEADER_FLAG_INITIALISED:
+            print(f"D:{self.config.port}:Extended Header Initialised, flags={self._extended_header.flags:08b}")
+        else:
+            print(f"D:{self.config.port}:Extended Header Not Initialised")
+            self._extended_header.flags |= _EXTENDED_HEADER_FLAG_INITIALISED
+            if self._write_extended_hexpansion_header(self._extended_header):
+                print(f"D:{self.config.port}:Extended Header Written, flags={self._extended_header.flags:08b}")
+        self._range_sensor: VL53L0X | None = None
+        #self._colour_sensor: OPT4060 | None = None
 
         # LS Pins
+        self._ALT_RANGE_pins: bool = False
         self._power_control: ePin = self.config.ls_pin[_ENABLE_PIN]
         self._led_control:   ePin = self.config.ls_pin[_LED_PIN]
-        self._dist_xshut:    ePin = self.config.ls_pin[_DIST_XSHUT_PIN]
         self._colour_int:    ePin = self.config.ls_pin[_COLOUR_INT_PIN]
-        self._dist_int:      ePin = self.config.ls_pin[_DIST_INT_PIN]
+        self._range_xshut:    ePin = self.config.ls_pin[_ALT_RANGE_XSHUT_PIN if self._extended_header.flags & _EXTENDED_HEADER_FLAG_DIST_PINS_SWAPPED else _RANGE_XSHUT_PIN]
+        self._range_int:      ePin = self.config.ls_pin[_ALT_RANGE_INT_PIN if self._extended_header.flags & _EXTENDED_HEADER_FLAG_DIST_PINS_SWAPPED else _RANGE_INT_PIN]
+
         # Servo related
         self._servo_pin_map: tuple[int, int, int, int] = self._hexdrive_type.servo_pin_map
         self._servo_centre: list[int] = [_SERVO_CENTRE] * self._hexdrive_type.servos
@@ -119,6 +244,43 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 
         if not self.initialise():
             print("HexDriveApp init failed")
+
+
+    def _read_extended_hexpansion_header(self) -> ExtendedHexpansionHeader:
+        # We use the spare bytes of the first EEPROM sector, after the header, to store a flags
+        # which indicates if the distance sensor pins are swapped or not.
+        if self._i2c is None:
+            try:
+                self._i2c = I2C(self.config.port)
+            except Exception as e:          # pylint: disable=broad-exception-caught
+                print(f"D:{self.config.port}:i2c setup failed {e}")
+                return ExtendedHexpansionHeader(flags=0)  # return a default header with no flags set
+        try:
+            extended_header_bytes = self._i2c.readfrom_mem(_ADDR, _EXTENDED_HEADER_ADDR, _EXTENDED_HEADER_SIZE, addrsize=_ADDR_LEN * 8)
+            self._extended_header = ExtendedHexpansionHeader.from_bytes(extended_header_bytes)
+        except Exception as e:          # pylint: disable=broad-exception-caught
+            print(f"D:{self.config.port}:extended header read failed {e}")
+            self._extended_header = ExtendedHexpansionHeader(flags=0)  # return a default header with no flags set
+        return self._extended_header
+
+
+    def _write_extended_hexpansion_header(self, header: ExtendedHexpansionHeader) -> bool:
+        # we know that on our EEPROM the extended header is stored in the first sector after the main header, so we
+        # can write it directly to that location and it all fits wihtin the page size of the EEPROM so we don't need to worry about chunking it up.
+        # the bytes in this EEPROM space must be blank (0xFF) before we write to it, otherwise the write will fail.
+        if self._i2c is None:
+            try:
+                self._i2c = I2C(self.config.port)
+            except Exception as e:          # pylint: disable=broad-exception-caught
+                print(f"D:{self.config.port}:i2c setup failed {e}")
+                return False
+        try:
+            header_bytes = header.to_bytes()
+            self._i2c.writeto_mem(_ADDR, _EXTENDED_HEADER_ADDR, header_bytes, addrsize=_ADDR_LEN * 8)
+            return True
+        except Exception as e:          # pylint: disable=broad-exception-caught
+            print(f"D:{self.config.port}:extended header write failed {e}")
+            return False
 
 
     def initialise(self) -> bool:
@@ -134,9 +296,9 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         try:
             self._power_control.init(mode=Pin.OUT)
             self._led_control.init(mode=Pin.OUT)
-            self._dist_xshut.init(mode=Pin.OUT)
+            self._range_xshut.init(mode=Pin.OUT)
             self._colour_int.init(mode=Pin.IN)
-            self._dist_int.init(mode=Pin.IN)
+            self._range_int.init(mode=Pin.IN)
         except Exception as e:      # pylint: disable=broad-except
             print(f"D:{self.config.port}:ls_pin setup failed {e}")
             return False
@@ -147,7 +309,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         # We delay the PWM initialisation until we actually need to set a servo position or motor speed
         # because there are a limited number of PWM resources and we want to leave them available for
         # other apps to use if the HexDrive is not actively being used.
-
+        # So here we just initialise the internal frequency array to the default values for motors and servos
         for channel in range(self._hexdrive_type.motors):
             print(f"D:{self.config.port}:Motor {channel} on Physical channels {channel<<1} & {(channel<<1) + 1}")
             self._motor_output[channel] = 0  # initialise motor output state to 0 (stopped)
@@ -160,9 +322,6 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 print(f"D:{self.config.port}:Servo {channel} on Physical channel {physical_channel}")
                 self._freq[physical_channel] = _DEFAULT_SERVO_FREQ
         self._pwm_setup = True
-
-        # ensure distance sensor is enabled to start with (if we have a version of the hardware with a distance sensor)
-        self.set_dist_xshut(True)
 
         return True
 
@@ -192,6 +351,14 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         for _channel in range(_MAX_NUM_CHANNELS):
             self._freq[_channel] = 0
         self._pwm_setup = False
+        if self._range_sensor is not None:
+            try:
+                self._range_sensor.stop()
+                # remove irq callback TODO is this right?
+                self._range_int.irq(handler=None)
+            except Exception:       # pylint: disable=broad-except
+                pass
+            self._range_sensor = None
 
 
     def background_update(self, delta: int):
@@ -214,6 +381,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                     except Exception as e:          # pylint: disable=broad-except
                         print(self._pwm_log_string(channel) + f"Off failed {e}")
                         self.PWMOutput[channel] = None  # Tidy Up
+
 
 
     def get_status(self) -> bool:
@@ -242,11 +410,11 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         return True
 
 
-    def set_dist_xshut(self, state: bool) -> bool:
+    def set_range_xshut(self, state: bool) -> bool:
         """ Set the state of the distance sensor XSHUT pin to power cycle it for reset or power saving. Returns success or failure. """
         try:
-            self._dist_xshut.init(mode=Pin.OUT)
-            self._dist_xshut.value(state)
+            self._range_xshut.init(mode=Pin.OUT)
+            self._range_xshut.value(state)
             if self._logging:
                 print(f"D:{self.config.port}:Distance Sensor XSHUT={'On' if state else 'Off'}")
             return True
@@ -266,6 +434,43 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         except Exception as e:      # pylint: disable=broad-except
             print(f"D:{self.config.port}:Colour Sensor LED control failed {e}")
             return False
+
+
+    def range_enable(self, enable: bool) -> bool:
+        """ Enable or disable the distance sensor. Returns success or failure. """
+        if self._range_sensor is None and enable:
+            try:
+                if self._i2c is None:
+                    self._i2c = I2C(self.config.port)
+                self._range_sensor = VL53L0X(self._i2c)
+                if self._range_sensor is not None and self._logging:
+                    print(f"D:{self.config.port}:Distance Sensor Initialised")
+            except Exception as e:      # pylint: disable=broad-except
+                print(f"D:{self.config.port}:Distance Sensor Initialisation failed {e}")
+                return False
+        if self._range_sensor is not None:
+            try:
+                if enable:
+                    self.set_range_xshut(True)
+                    # configure interrupt pin to trigger on falling edge when a new range measurement is ready
+                    self._range_int.init(mode=Pin.IN)
+                    self._range_int.irq(trigger=Pin.IRQ_FALLING, handler=_handle_range_interrupt())
+                    self._range_sensor.start()
+                    if self._logging:
+                        print(f"D:{self.config.port}:Distance Sensor Started")
+                else:
+                    self._range_sensor.stop()
+                    self.set_range_xshut(False)
+                    if self._logging:
+                        print(f"D:{self.config.port}:Distance Sensor Stopped")
+                return True
+            except Exception as e:      # pylint: disable=broad-except
+                print(f"D:{self.config.port}:Distance Sensor control failed {e}")
+                return False
+        elif not enable:
+            # sensor is already disabled so nothing to do
+            return True
+        return False
 
 
     def set_keep_alive(self, period: int):
@@ -575,6 +780,369 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         #components.append([int(item) if item.isdigit() else item for item in pre_components])
         #components.append([int(item) if item.isdigit() else item for item in build_components])
         return components
+
+
+
+
+"""
+VL53L0X Time-of-Flight distance sensor driver.
+
+Default I2C address: 0x29
+Measurement: distance in mm (up to ~1200 mm in default mode).
+
+This driver uses single-shot ranging.
+
+Datasheet: https://www.st.com/resource/en/datasheet/vl53l0x.pdf
+"""
+
+_I2C_ADDRESS = const(0x29)
+_WHO_AM_I_REG    = const(0xC0)
+_WHO_AM_I_EXPECT = const(0xEE)
+
+# Key registers (abridged - sufficient for single-shot ranging)
+_SYSRANGE_START                              = const(0x00)
+_SYSTEM_SEQUENCE_CONFIG                      = const(0x01)
+_SYSTEM_INTERRUPT_CONFIG                     = const(0x0A)
+_SYSTEM_INTERRUPT_CLEAR                      = const(0x0B)
+_RESULT_INTERRUPT_STATUS                     = const(0x13)
+_RESULT_RANGE_STATUS                         = const(0x14)
+_MSRC_CONFIG_CONTROL                         = const(0x60)
+_FINAL_RANGE_CONFIG_MIN_COUNT_RATE_RTN_LIMIT = const(0x44)
+_GPIO_HV_MUX_ACTIVE_HIGH                     = const(0x84)
+_GLOBAL_CONFIG_SPAD_ENABLES_REF_0            = const(0xB0)
+_GLOBAL_CONFIG_REF_EN_START_SELECT           = const(0xB6)
+_DYNAMIC_SPAD_NUM_REQUESTED_REF_SPAD         = const(0x4E)
+_DYNAMIC_SPAD_REF_EN_START_OFFSET            = const(0x4F)
+_VHV_CONFIG_PAD_SCL_SDA__EXTSUP_HV           = const(0x89)
+
+_STOP_VARIABLE_REG = const(0x91)
+_SPAD_INFO_REG = const(0x92)
+_SPAD_POLL_REG = const(0x83)
+_INTERRUPT_READY_MASK = const(0x07)
+
+_RANGE_TIMEOUT_MS = const(100)   # ms to wait for a measurement
+
+_DEFAULT_TUNING_SETTINGS = (
+    (const(0xFF), const(0x01)), (const(0x00), const(0x00)),
+    (const(0xFF), const(0x00)), (const(0x09), const(0x00)), (const(0x10), const(0x00)), (const(0x11), const(0x00)),
+    (const(0x24), const(0x01)), (const(0x25), const(0xFF)), (const(0x75), const(0x00)),
+    (const(0xFF), const(0x01)), (const(0x4E), const(0x2C)), (const(0x48), const(0x00)), (const(0x30), const(0x20)),
+    (const(0xFF), const(0x00)), (const(0x30), const(0x09)), (const(0x54), const(0x00)), (const(0x31), const(0x04)),
+    (const(0x32), const(0x03)), (const(0x40), const(0x83)), (const(0x46), const(0x25)), (const(0x60), const(0x00)),
+    (const(0x27), const(0x00)), (const(0x50), const(0x06)), (const(0x51), const(0x00)), (const(0x52), const(0x96)),
+    (const(0x56), const(0x08)), (const(0x57), const(0x30)), (const(0x61), const(0x00)), (const(0x62), const(0x00)),
+    (const(0x64), const(0x00)), (const(0x65), const(0x00)), (const(0x66), const(0xA0)),
+    (const(0xFF), const(0x01)), (const(0x22), const(0x32)), (const(0x47), const(0x14)), (const(0x49), const(0xFF)),
+    (const(0x4A), const(0x00)),
+    (const(0xFF), const(0x00)), (const(0x7A), const(0x0A)), (const(0x7B), const(0x00)), (const(0x78), const(0x21)),
+    (const(0xFF), const(0x01)), (const(0x23), const(0x34)), (const(0x42), const(0x00)), (const(0x44), const(0xFF)),
+    (const(0x45), const(0x26)), (const(0x46), const(0x05)), (const(0x40), const(0x40)), (const(0x0E), const(0x06)),
+    (const(0x20), const(0x1A)), (const(0x43), const(0x40)),
+    (const(0xFF), const(0x00)), (const(0x34), const(0x03)), (const(0x35), const(0x44)),
+    (const(0xFF), const(0x01)), (const(0x31), const(0x04)), (const(0x4B), const(0x09)), (const(0x4C), const(0x05)),
+    (const(0x4D), const(0x04)),
+    (const(0xFF), const(0x00)), (const(0x44), const(0x00)), (const(0x45), const(0x20)), (const(0x47), const(0x08)),
+    (const(0x48), const(0x28)), (const(0x67), const(0x00)), (const(0x70), const(0x04)), (const(0x71), const(0x01)),
+    (const(0x72), const(0xFE)), (const(0x76), const(0x00)), (const(0x77), const(0x00)),
+    (const(0xFF), const(0x01)), (const(0x0D), const(0x01)),
+    (const(0xFF), const(0x00)), (const(0x80), const(0x01)), (const(0x01), const(0xF8)),
+    (const(0xFF), const(0x01)), (const(0x8E), const(0x01)), (const(0x00), const(0x01)),
+    (const(0xFF), const(0x00)), (const(0x80), const(0x00)),
+)
+
+class VL53L0X():
+    """VL53L0X Time-of-Flight distance sensor driver."""
+    I2C_ADDR = _I2C_ADDRESS
+    READ_INTERVAL_MS = 100
+
+    def __init__(self, i2c: I2C, logging: bool = False):
+        self._i2c = i2c
+        self._ready = False
+        self._i2c_addr = self.I2C_ADDR
+        self._stop_variable = 0             # used to store the stop variable value for the VL53L0X sensor
+        self._logging = logging
+
+
+    @property
+    def logging(self) -> bool:
+        return self._logging
+
+
+    @logging.setter
+    def logging(self, value: bool):
+        self._logging = value
+
+
+    def _read_u8(self, reg: int) -> int:
+        try:
+            return self._i2c.readfrom_mem(self._i2c_addr, reg, 1)[0]
+        except Exception as e:      # pylint: disable=broad-exception-caught
+            self._ready = False
+            if self._logging:
+                print(f"D:VL53L0X read error: {e}")
+            return 0
+
+
+    def _write_u8(self, reg: int, value: int) -> bool:
+        try:
+            self._i2c.writeto_mem(self._i2c_addr, reg, bytes([value & 0xFF]))
+            return True
+        except Exception as e:      # pylint: disable=broad-exception-caught
+            self._ready = False
+            if self._logging:
+                print(f"D:VL53L0X write error: {e}")
+            return False
+
+
+    def _read_u16_be(self, reg: int) -> int:
+        try:
+            d = self._i2c.readfrom_mem(self._i2c_addr, reg, 2)
+            return (d[0] << 8) | d[1]
+        except Exception as e:      # pylint: disable=broad-exception-caught
+            self._ready = False
+            if self._logging:
+                print(f"D:VL53L0X read error: {e}")
+            return 0
+
+
+    def _init(self) -> bool:
+        try:
+            who = self._read_u8(_WHO_AM_I_REG)
+        except Exception as e:      # pylint: disable=broad-exception-caught
+            if self._logging:
+                print(f"D:Cannot read VL53L0X ID: {e}")
+            return False
+        if who != _WHO_AM_I_EXPECT:
+            if self._logging:
+                print(f"D:VL53L0X unexpected ID 0x{who:02X} (expected 0x{_WHO_AM_I_EXPECT:02X})")
+            return False
+
+        # The VL53L0X needs a substantial startup sequence before single-shot
+        # ranging becomes trustworthy;
+        if not self._write_u8(
+            _VHV_CONFIG_PAD_SCL_SDA__EXTSUP_HV,
+            self._read_u8(_VHV_CONFIG_PAD_SCL_SDA__EXTSUP_HV) | 0x01):
+            return False
+        if not self._write_u8(0x88, 0x00):
+            return False
+        if not self._open_stop_variable_window():
+            return False
+        self._stop_variable = self._read_u8(_STOP_VARIABLE_REG)
+        if not self._close_stop_variable_window():
+            return False
+
+        if not self._write_u8(
+            _MSRC_CONFIG_CONTROL,
+            self._read_u8(_MSRC_CONFIG_CONTROL) | 0x12):
+            return False
+        if not self._set_signal_rate_limit(0.25):
+            return False
+        if not self._write_u8(_SYSTEM_SEQUENCE_CONFIG, 0xFF):
+            return False
+
+        spad_info = self._get_spad_info()
+        if spad_info is None:
+            return False
+
+        spad_count, spad_type_is_aperture = spad_info
+        ref_spad_map = bytearray(self._i2c.readfrom_mem(self._i2c_addr, _GLOBAL_CONFIG_SPAD_ENABLES_REF_0, 6))
+        if not self._write_u8(0xFF, 0x01):
+            return False
+        if not self._write_u8(_DYNAMIC_SPAD_REF_EN_START_OFFSET, 0x00):
+            return False
+        if not self._write_u8(_DYNAMIC_SPAD_NUM_REQUESTED_REF_SPAD, 0x2C):
+            return False
+        if not self._write_u8(0xFF, 0x00):
+            return False
+        if not self._write_u8(_GLOBAL_CONFIG_REF_EN_START_SELECT, 0xB4):
+            return False
+
+        first_spad_to_enable = 12 if spad_type_is_aperture else 0
+        spads_enabled = 0
+        for index in range(48):
+            if index < first_spad_to_enable or spads_enabled == spad_count:
+                ref_spad_map[index // 8] &= ~(1 << (index % 8))
+                continue
+            if (ref_spad_map[index // 8] >> (index % 8)) & 0x01:
+                spads_enabled += 1
+        if not self._i2c.writeto_mem(self._i2c_addr, _GLOBAL_CONFIG_SPAD_ENABLES_REF_0, bytes(ref_spad_map)):
+            return False
+
+        for reg, value in _DEFAULT_TUNING_SETTINGS:
+            if not self._write_u8(reg, value):
+                return False
+
+        if not self._write_u8(_SYSTEM_INTERRUPT_CONFIG, 0x04):
+            return False
+        if not self._write_u8(
+            _GPIO_HV_MUX_ACTIVE_HIGH,
+            self._read_u8(_GPIO_HV_MUX_ACTIVE_HIGH) & ~0x10,
+        ):
+            return False
+        if not self._write_u8(_SYSTEM_INTERRUPT_CLEAR, 0x01):
+            return False
+
+        if not self._write_u8(_SYSTEM_SEQUENCE_CONFIG, 0xE8):
+            return False
+        if not self._write_u8(_SYSTEM_SEQUENCE_CONFIG, 0x01):
+            return False
+        if not self._perform_single_ref_calibration(0x40):
+            return False
+        if not self._write_u8(_SYSTEM_SEQUENCE_CONFIG, 0x02):
+            return False
+        if not self._perform_single_ref_calibration(0x00):
+            return False
+        if not self._write_u8(_SYSTEM_SEQUENCE_CONFIG, 0xE8):
+            return False
+        self._ready = True
+        return True
+
+
+    def start(self) -> bool:
+        if not self._ready:
+            if not self._init():
+                return False
+        if not self._prepare_single_shot():
+            return False
+        if not self._write_u8(_SYSRANGE_START, 0x01):
+            return False
+        return True
+
+
+    def stop(self) -> bool:
+        if not self._write_u8(_SYSRANGE_START, 0x00):
+            return False
+        return True
+
+
+    def get_range(self) -> int:
+        """ Get a single range measurement in mm. Returns distance in mm, or 0 on error. """
+        if not self._ready:
+            # Sensor not configured/available
+            return 0
+
+        # TODO - do we need to check both _SYSRANGE_START and _RESULT_INTERRUPT_STATUS to see if the sensor is ready for a new measurement? or can we be more efficient by just checking one of them?
+        if  self._read_u8(_SYSRANGE_START) & 0x01:
+            # Sensor is still performing a measurement, so we will return a timeout error.
+            return 0
+
+        # Check that the sensor is ready to give us back a range measurement. If not, we will return a timeout error.
+        if (self._read_u8(_RESULT_INTERRUPT_STATUS) & _INTERRUPT_READY_MASK) == 0:
+            # Sensor does not have a range measurement ready yet, so we will return a timeout error.
+            return 0
+
+        # The range value lives 10 bytes into the RESULT_RANGE_STATUS block in ST's register map; this offset matches the reference driver.
+        dist_mm = self._read_u16_be(_RESULT_RANGE_STATUS + 10)
+        if self._logging:
+            print(f"D:VL53L0X measured {dist_mm} mm")
+
+        # Clear the interrupt so that the sensor is ready for the next measurement.
+        self._write_u8(_SYSTEM_INTERRUPT_CLEAR, 0x01)
+        return dist_mm
+
+
+    def _open_stop_variable_window(self) -> bool:
+        if not self._write_u8(0x80, 0x01):
+            return False
+        if not self._write_u8(0xFF, 0x01):
+            return False
+        if not self._write_u8(0x00, 0x00):
+            return False
+        return True
+
+
+    def _close_stop_variable_window(self) -> bool:
+        if not self._write_u8(0x00, 0x01):
+            return False
+        if not self._write_u8(0xFF, 0x00):
+            return False
+        if not self._write_u8(0x80, 0x00):
+            return False
+        return True
+
+
+    def _prepare_single_shot(self) -> bool:
+        if not self._open_stop_variable_window():
+            return False
+        if not self._write_u8(_STOP_VARIABLE_REG, self._stop_variable):
+            return False
+        if not self._close_stop_variable_window():
+            return False
+        return True
+
+
+    def _wait_for_interrupt_ready(self) -> bool:
+        #TODO use the GPIO interrupt pin to trigger a callback when the measurement is ready isntead of waiting here...
+        deadline = time.ticks_add(time.ticks_ms(), _RANGE_TIMEOUT_MS)
+        while (self._read_u8(_RESULT_INTERRUPT_STATUS) & _INTERRUPT_READY_MASK) == 0:
+            if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
+                return False
+            time.sleep_ms(1)
+        return True
+
+
+    def _perform_single_ref_calibration(self, vhv_init_byte: int) -> bool:
+        if not self._write_u8(_SYSRANGE_START, 0x01 | vhv_init_byte):
+            return False
+        if not self._wait_for_interrupt_ready():
+            return False
+        if not self._write_u8(_SYSTEM_INTERRUPT_CLEAR, 0x01):
+            return False
+        if not self._write_u8(_SYSRANGE_START, 0x00):
+            return False
+        return True
+
+
+    def _set_signal_rate_limit(self, limit_mcps: float) -> bool:
+        int_limit = int(limit_mcps * (1 << 7))
+        if not self._i2c.writeto_mem(self._i2c_addr, _FINAL_RANGE_CONFIG_MIN_COUNT_RATE_RTN_LIMIT, bytes([(int_limit >> 8) & 0xFF, int_limit & 0xFF])):
+            return False
+        return True
+
+
+    def _get_spad_info(self) -> tuple[int, bool] | None:
+        if not self._open_stop_variable_window():
+            return None
+        if not self._write_u8(0xFF, 0x06):
+            return None
+        if not self._write_u8(_SPAD_POLL_REG, self._read_u8(_SPAD_POLL_REG) | 0x04):
+            return None
+        if not self._write_u8(0xFF, 0x07):
+            return None
+        if not self._write_u8(0x81, 0x01):
+            return None
+        if not self._write_u8(0x80, 0x01):
+            return None
+        if not self._write_u8(0x94, 0x6B):
+            return None
+        if not self._write_u8(_SPAD_POLL_REG, 0x00):
+            return None
+
+
+        # TODO - try to avoid use of time.sleep_ms() in this driver as it blocks the main loop and prevents other tasks from running
+        deadline = time.ticks_add(time.ticks_ms(), _RANGE_TIMEOUT_MS)
+        while self._read_u8(_SPAD_POLL_REG) == 0x00:
+            if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
+                return None
+            time.sleep_ms(1)
+
+        if not self._write_u8(_SPAD_POLL_REG, 0x01):
+            return None
+        spad_info = self._read_u8(_SPAD_INFO_REG)
+
+        if not self._write_u8(0x81, 0x00):
+            return None
+        if not self._write_u8(0xFF, 0x06):
+            return None
+        if not self._write_u8(_SPAD_POLL_REG, self._read_u8(_SPAD_POLL_REG) & ~0x04):
+            return None
+        if not self._write_u8(0xFF, 0x01):
+            return None
+        if not self._close_stop_variable_window():
+            return None
+
+        return spad_info & 0x7F, ((spad_info >> 7) & 0x01) == 1
+
 
 
 __app_export__ = HexDriveApp
