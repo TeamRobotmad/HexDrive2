@@ -226,6 +226,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                     print(f"D:{self.config.port}:Extended Header Written, flags={self._extended_header.flags:08b}")
 
         self._last_range: int | None = None                    # most recent distance measurement (mm), or None until the first reading arrives
+        self._range_ready: bool = False                        # set by the data-ready interrupt; consumed in background_update() to read + emit the measurement
         self._range_period_ms: int = _DEFAULT_RANGE_PERIOD_MS  # inter-measurement period for continuous ranging (0 = back-to-back / as fast as the sensor allows)
         #self._colour_sensor: OPT4060 | None = None
 
@@ -315,12 +316,27 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 pass
             self._range_sensor = None
             self._last_range = None
+            self._range_ready = False
 
 
     # Special function called by the BadgeOS to allow the app to do any background processing it needs to do.
     # do not change the name of this function as it is called by the BadgeOS in the main loop of the BadgeOS.
     def background_update(self, delta: int):
         """ This is called from the main loop of the BadgeOS to allow the app to do any background processing it needs to do. """
+        # Distance sensor: the data-ready interrupt only sets a flag, because it runs in a restricted
+        # scheduler context where I2C and asyncio/eventbus access are unsafe. We do the actual I2C read
+        # and RangeEvent emission here, in the safe cooperative main-loop context.
+        if self._range_ready:
+            self._range_ready = False
+            sensor = self._range_sensor
+            if sensor is not None:
+                distance = sensor.read()    # reads the measurement and clears the interrupt to re-arm the sensor
+                if distance is not None:
+                    self._last_range = distance
+                    eventbus.emit(self.RangeEvent(distance))
+                    if self._logging:
+                        print(f"D:{self.config.port}:Range={distance}mm")
+
         if not self._pwm_setup or not self._outputs_energised:
             # if we are not properly initialised then do not attempt to do anything
             return
@@ -624,14 +640,13 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         Args:
             enable: True to start ranging, False to stop it and power the sensor down.
         """
-        if self._range_sensor is None and enable:
-            if self._i2c is None:
-                self._i2c = I2C(self.config.port)
-            self._range_sensor = VL53L0X(self._i2c, logging=self._logging)
-        sensor = self._range_sensor
-        if sensor is None:
-            raise RuntimeError(f"D:{self.config.port}:Distance Sensor not initialised")
+
         if enable:
+            if self._range_sensor is None:
+                if self._i2c is None:
+                    self._i2c = I2C(self.config.port)
+                self._range_sensor = VL53L0X(self._i2c, logging=self._logging)
+            sensor = self._range_sensor
             # Release the sensor from reset. It needs ~1.2ms to boot before it answers on I2C.
             # This is a one-off setup path (not the periodic update loop) so a short blocking wait
             # here is acceptable and keeps the steady-state ranging fully interrupt driven.
@@ -642,25 +657,38 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             # first "measurement ready" falling edge cannot be missed.
             #
             # A *bound method* is passed as the handler. The badge delivers LS-pin interrupts with
-            # mp_sched_schedule(handler, pin) - i.e. from the normal scheduler context, not a hard
-            # ISR - so I2C reads and event emission inside the handler are safe, and it passes the
-            # LS pin as the sole argument. Because the handler is bound, its 'self' already carries
-            # this app instance, and therefore the sensor object and the event bus, with it. That is
-            # the most efficient way for the interrupt to know the context of the sensor that fired:
-            # no module globals, no lookup tables, no searching - just a direct attribute access.
+            # mp_sched_schedule(handler, pin) - it passes the LS pin as the sole argument, and because
+            # the handler is bound its 'self' already carries this app instance (and therefore the
+            # sensor object and the flag we set) with it. That is the most efficient way for the
+            # interrupt to know the context of the sensor that fired: no module globals, no lookup
+            # tables, no searching - just a direct attribute access. NOTE the handler only sets a flag;
+            # the actual I2C read and RangeEvent emission are deferred to background_update() because
+            # this scheduler context must not touch asyncio (see _handle_range_interrupt).
+            #
+            # We MUST register for BOTH edges. The AW9523B expander interrupts on any change and the
+            # badge firmware's C ISR shim (tildagon_pin_isr_handler) schedules whatever Python handler
+            # is in the slot for the edge that occurred - with NO null check. When we clear the sensor's
+            # interrupt (in read()) the line goes high, producing a rising edge; if only the falling
+            # edge were registered, the rising-edge slot would be MP_OBJ_NULL and the VM would crash
+            # (Guru Meditation LoadProhibited, EXCVADDR 0x0) trying to call NULL. Handling both edges is
+            # harmless: the spurious rising-edge callback just sets the flag, and read() then finds no
+            # measurement ready and returns without emitting.
             self._range_int.init(mode=Pin.IN)
-            self._range_int.irq(trigger=Pin.IRQ_FALLING, handler=self._handle_range_interrupt)
+            self._range_int.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, handler=self._handle_range_interrupt)
             sensor.start(self._range_period_ms)
             if self._logging:
                 print(f"D:{self.config.port}:Distance Sensor Started")
-        else:
+        elif self._range_sensor is not None:
             self._range_int.irq(handler=None)   # detach the interrupt handler first
+            sensor = self._range_sensor
             sensor.stop()           # stop continuous ranging
             self.set_range_xshut(False)         # power the sensor down (holds it in hardware reset)
             sensor.reset()          # force a full re-initialisation next time it is enabled
             self._last_range = None
+            self._range_ready = False
             if self._logging:
                 print(f"D:{self.config.port}:Distance Sensor Stopped")
+            raise RuntimeError(f"D:{self.config.port}:Distance Sensor not initialised")
 
 
     def get_range_mm(self) -> int | None:
@@ -869,8 +897,10 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 print(f"D:{self.config.port}:Distance Sensor create failed {e}")
                 return False
         # If it fails then there is a genuine fault - return False
+        self._range_sensor.logging = False              # suppress logging for this check, as it is expected to fail if the pins are swapped
         if not self._range_sensor.check_id():
-            print(f"D:{self.config.port}:Distance Sensor check failed")
+            #print(f"D:{self.config.port}:Distance Sensor check failed")
+            self._range_sensor.logging = self._logging
             return False
         # Then DISABLE the distance sensor by setting the XSHUT pin low, then wait a short time for the sensor to power down
         self.config.ls_pin[_RANGE_XSHUT_PIN].value(0)
@@ -878,8 +908,9 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         # Check if the distance sensor is present by trying to read the ID register from the sensor
         # If it fails then we know that the XSHUT pin is correct and has control over the sensor - leave flags as is and return True.
         if not self._range_sensor.check_id():
-            print(f"D:{self.config.port}:Distance Sensor shutdown by XSHUT low")
+            #print(f"D:{self.config.port}:Distance Sensor shutdown by XSHUT low")
             self._extended_header.flags &= ~_EXTENDED_HEADER_FLAG_DIST_PINS_SWAPPED
+            self._range_sensor.logging = self._logging
             return True
         # If it can still be read then try swapping the pins.
         self.config.ls_pin[_RANGE_XSHUT_PIN].value(1)
@@ -891,8 +922,10 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         if not self._range_sensor.check_id():
             print(f"D:{self.config.port}:Distance Sensor shutdown by ALT XSHUT low")
             self._extended_header.flags |= _EXTENDED_HEADER_FLAG_DIST_PINS_SWAPPED
+            self._range_sensor.logging = self._logging
             return True
-        print(f"D:{self.config.port}:Distance Sensor not shutdown by either XSHUT pin")
+        #print(f"D:{self.config.port}:Distance Sensor not shutdown by either XSHUT pin")
+        self._range_sensor.logging = self._logging
         return False
 
 
@@ -900,24 +933,31 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         """Distance-sensor data-ready interrupt handler (a *bound* method - see `range_enable`).
 
         Invoked via mp_sched_schedule from the badge's LS-pin interrupt plumbing whenever the VL53L0X
-        signals that a new continuous measurement is ready. Runs in the normal scheduler context, so
-        I2C access and event emission are safe here.
+        signals that a new continuous measurement is ready.
+
+        IMPORTANT: this runs in MicroPython's soft-scheduler context (between bytecodes), NOT as a
+        normal coroutine. That context is heavily restricted - in particular it must NOT touch asyncio
+        primitives, and eventbus.emit() ultimately calls asyncio.Event.set(), which mutates the async
+        scheduler's task queue. Doing that from here corrupts the queue and crashes the VM (the
+        Guru Meditation / LoadProhibited panic seen in testing). Performing I2C from here is unsafe too,
+        as it can collide with an in-progress transaction on the shared bus.
+
+        So we keep this as short as possible - just flag that a reading is waiting. background_update()
+        then performs the I2C read and emits the RangeEvent from the safe cooperative main-loop context.
+        The handler is deliberately a plain (non-async) function: the scheduler calls it directly, and a
+        coroutine would merely be created and never awaited. Its return value is ignored.
 
         Args:
             _pin: the LS pin object that fired (supplied by the scheduler, unused - the bound 'self'
                 already identifies the sensor).
         """
-        print(f"D:{self.config.port}:Distance Sensor interrupt fired")
-        sensor = self._range_sensor
-        if sensor is None:
-            # Interrupt arrived after the sensor was torn down - nothing to do.
+        # check the actual state of the interrupt pin to avoid spurious rising-edge callbacks (see `range_enable`).
+        if self._range_int.value() != 0:
             return
-        distance = sensor.read()        # read the measurement and clear the interrupt to re-arm the sensor
-        if distance is not None:
-            self._last_range = distance
-            eventbus.emit(self.RangeEvent(distance))
-            if self._logging:
-                print(f"D:{self.config.port}:Range={distance}mm")
+        # A bare attribute store is atomic with respect to the bytecode interpreter, so it is safe here.
+        self._range_ready = True
+        if self._logging:
+            print(f"D:{self.config.port}:Distance Sensor interrupt fired")
 
 
 """
@@ -1021,7 +1061,7 @@ class VL53L0X():
             who = self._read_u8(_WHO_AM_I_REG)
         except Exception as e:      # pylint: disable=broad-exception-caught
             if self._logging:
-                print(f"D:Cannot read VL53L0X ID: {e}")
+                print(f"D:VL53L0X check_id failed: {e}")
             return False
         if who != _WHO_AM_I_EXPECT:
             if self._logging:
@@ -1271,10 +1311,10 @@ class VL53L0X():
 
 
     def _perform_single_ref_calibration(self, vhv_init_byte: int) -> None:
-            self._write_u8(_SYSRANGE_START, 0x01 | vhv_init_byte)
-            self._wait_for_interrupt_ready()
-            self._write_u8(_SYSTEM_INTERRUPT_CLEAR, 0x01)
-            self._write_u8(_SYSRANGE_START, 0x00)
+        self._write_u8(_SYSRANGE_START, 0x01 | vhv_init_byte)
+        self._wait_for_interrupt_ready()
+        self._write_u8(_SYSTEM_INTERRUPT_CLEAR, 0x01)
+        self._write_u8(_SYSRANGE_START, 0x00)
 
 
     def _set_signal_rate_limit(self, limit_mcps: float) -> None:
