@@ -22,7 +22,7 @@ The current implementation is the BadgeBot-derived HexDrive app with support for
 Compile the EEPROM app with `mpy-cross`:
 
 ```bash
-mpy-cross -v hexdrive2.py -o hexdrive2.mpy
+mpy-cross -march=xtensawin -v hexdrive2.py -o hexdrive2.mpy
 ```
 
 The resulting `hexdrive2.mpy` should then be copied into the consuming app's `EEPROM/` directory. When a host app writes that file to a hexpansion EEPROM it is renamed to `app.mpy` on the EEPROM so BadgeOS will discover it automatically.
