@@ -3,7 +3,9 @@
 # This is the app to be installed from a HexDrive2 Hexpansion EEPROM.
 # it is compiled and copied onto the EEPROM as app.mpy
 # It is then run from the EEPROM by the BadgeOS.
-import time # aim to eliminate this dependency
+
+import time
+
 try:
     from micropython import const
 except ImportError:
@@ -16,9 +18,11 @@ from events import Event
 from system.eventbus import eventbus
 from system.hexpansion.config import HexpansionConfig
 from system.hexpansion import app as hexpansion_app
+from system.hexpansion.util import get_slots_by_vid_pid
 from system.scheduler.events import RequestStopAppEvent
 import app
 from tildagon import Pin as ePin
+import micropython
 
 # Define the minimum BadgeOS version required to run this app (e.g. if we need features that are only available in a certain version of BadgeOS)
 _MIN_BADGEOS_VERSION = [2, 0, 0]     # v2.0.0 is required to be able to use the new hexpansion utilites
@@ -48,18 +52,21 @@ _EXTENDED_HEADER_MAGIC = b"HDR2"            # Magic bytes to identify the extend
 _EXTENDED_HEADER_VERSION = b"2026"          # Version of the extended header format
 
 # EXTENDED header flags constants
-_EXTENDED_HEADER_FLAG_INITIALISED = const(0x01)  # Flag indicating that the extended header has been initialised
-_EXTENDED_HEADER_FLAG_RANGE_SENSOR = const(0x02)  # Flag indicating that the distance sensor pins are swapped
-_EXTENDED_HEADER_FLAG_RANGE_PINS_SWAPPED = const(0x04)  # Flag indicating that the distance sensor pins are swapped
-_EXTENDED_HEADER_FLAG_COLOUR_SENSOR = const(0x08)  # Flag indicating that the colour sensor is present
-_EXTENDED_HEADER_FLAG_FLOOD_LEDS = const(0x10)  # Flag indicating that the flood LEDs are present
+_EXTENDED_HEADER_FLAG_RANGE_SENSOR        = const(0x0001)  # Flag indicating that the distance sensor pins are swapped
+_EXTENDED_HEADER_FLAG_COLOUR_SENSOR       = const(0x0002)  # Flag indicating that the colour sensor is present
+_EXTENDED_HEADER_FLAG_FLOOD_LEDS          = const(0x0004)  # Flag indicating that the flood LEDs are present
+_EXTENDED_HEADER_FLAG_RANGE_PINS_SWAPPED  = const(0x4000)  # Flag indicating that the distance sensor pins are swapped
+_EXTENDED_HEADER_FLAG_INITIALISED         = const(0x8000)  # Flag indicating that the extended header has been initialised
+
+
 
 
 # Default values and limits:
 _DEFAULT_PWM_FREQ = const(20000)           # 20kHz is a good default for motors as it is above the audible range for most people and works with most motors and ESCs
 _DEFAULT_SERVO_FREQ = const(50)            # 50Hz = 20mS period
 _DEFAULT_KEEP_ALIVE_PERIOD = const(1000)   # 1 second
-_DEFAULT_RANGE_PERIOD_MS = const(0)        # default inter-measurement period (ms) for continuous distance ranging (~20 readings/s); 0 = back-to-back (as fast as the sensor allows)
+_DEFAULT_RANGE_PERIOD_MS = const(100)      # default inter-measurement period (ms) for continuous distance ranging; 0 = back-to-back (as fast as the sensor allows)
+_DEFAULT_COLOUR_PERIOD_MS = const(100)     # default inter-measurement period (ms) for continuous colour readings ; 0 = back-to-back (as fast as the sensor allows)
 _MAX_NUM_CHANNELS = const(4)               # Max number of PWM channels supported by any type of HexDrive (Hexpansion limitation, not BadgeBot limit)
 _MAX_NUM_MOTORS = const(2)                 # Max number of motor channels supported by any type of HexDrive
 
@@ -68,6 +75,17 @@ _MAX_SERVO_FREQ = const(200)               # 200Hz = 5mS period (can work with s
 _SERVO_CENTRE    = const(1500)             # 1500us pulse width is the centre position for most RC servos (but some may be different, so we allow this to be trimmed)
 _MAX_SERVO_RANGE = const(1400)             # 1400us either side of centre (VERY WIDE)
 _SERVO_MAX_TRIM  = const(1000)             # 1000us either side of centre for trimming the centre position
+
+_COLOUR_BLACK  = "Black"
+_COLOUR_WHITE  = "White"
+_COLOUR_RED    = "Red"
+_COLOUR_GREEN  = "Green"
+_COLOUR_BLUE   = "Blue"
+_COLOUR_YELLOW = "Yellow"
+_COLOUR_CYAN   = "Cyan"
+_COLOUR_MAGENTA= "Magenta"
+_COLOUR_ORANGE = "Orange"
+_COLOUR_GRAY   = "Gray"
 
 
 class HexDriveType:
@@ -101,6 +119,8 @@ _DEFAULT_HEXDRIVE_TYPE = _HEXDRIVE_TYPES[0]  # default to the uncommitted versio
 # --------------------------------------------------------------------------------------------------------------
 class ExtendedHexpansionHeader:
     """ Represents the extended header of the hexpansion EEPROM, which is stored in the spare bytes of the first page of the EEPROM. """
+    __slots__ = ("manifest_version", "flags", "spare")
+
     _header_format = "<4s4sI19s"
     _magic = _EXTENDED_HEADER_MAGIC
 
@@ -168,31 +188,89 @@ class ExtendedHexpansionHeader:
         )
 
 
+###############################
+# HARDWARE DIAGNOSTICS OUTPUT #
+###############################
+_HEXDIAG_VID = const(0xCBCB)    # Vendor ID for Team RobotMad
+_HEXDIAG_PID = const(0x4000)    # Product ID for HexDiagnostics Hexpansion
+
+# The HexDiag needs to be in a slot BEFORE the one that this HexDrive is in
+# so that it is already known when we are being initialised.
+
+class HexDiagnostics():
+    """Class to manage the diagnostics output pins on a spare Hexpansion for monitoring with an oscilloscope."""
+    __slots__ = ("_diag_config",)
+
+    def __init__(self):
+        self._diag_config: HexpansionConfig | None = None
+        slots = get_slots_by_vid_pid(_HEXDIAG_VID, _HEXDIAG_PID)
+        if slots:
+            hexdiag_port = slots[0]
+            print(f"D:HexDiag on port {hexdiag_port}")
+            self._diag_config = HexpansionConfig(hexdiag_port)
+            for i in range(4):
+                self._diag_config.pin[i].init(mode=Pin.OUT)
+
+
+    def output(self, index: int, value: int):
+        """Output diagnostic values to the HS pins on the diagnostics hexpansion, for measurement with an oscilloscope"""
+        if self._diag_config:
+            self._diag_config.pin[index].value(value)
+
+
 #----------------------------------------------------------------
 # HexDriveApp class
 #----------------------------------------------------------------
 class HexDriveApp(app.App):         # pylint: disable=no-member
     """ HexDrive Hexpansion App for BadgeBot."""
+    # Lock down every single attribute instantiated inside __init__
+    __slots__ = (
+        "config", "_logging", "_i2c", "_hexdrive_type",
+        "_keep_alive_period", "_power_state", "_pwm_setup",
+        "_time_since_last_update", "_outputs_energised",
+        "pwm_outputs", "_freq", "_motor_output", "_extended_header",
+        "_time_since_last_sensor_check",
+        "range_sensor", "_range_period_ms", "colour_sensor",
+        "_colour_period_ms", "_power_control", "_led_control",
+        "_colour_int", "_range_xshut", "_range_int", "_servo_pin_map",
+        "_servo_centre", "_cached_range_event", "_cached_colour_event",
+        "_range_events_enabled", "_colour_events_enabled",
+        "_i2c_buffer_32", "_diagnostics"
+    )
+
     VERSION = 2         # Increment this when making changes to the app that require the hexpansion EEPROM app to be re-flashed with the new code.
+
 
     class RangeEvent(Event):
         """Emitted when a new ToF distance measurement is obtained, providing the distance to target in mm."""
+        __slots__ = ("range",)  # Drops RAM usage to a raw C-pointer array
         def __init__(self, distance: int):
             self.range = distance
 
         def __str__(self):
             return f"Range: {self.range}mm"
 
-
     class ColourEvent(Event):
         """Emitted when a new colour measurement is obtained, providing the RGBW values."""
-        def __init__(self, colour: tuple[int, int, int, int], colour_name: str):
+        __slots__ = ("colour",)  # Drops RAM usage to a raw C-pointer array
+        def __init__(self, colour: tuple[int, int, int, int]):
             self.colour = colour
-            self.colour_name = colour_name
 
         def __str__(self):
-            return f"Colour: {self.colour_name} (R={self.colour[0]}, G={self.colour[1]}, B={self.colour[2]}, W={self.colour[3]})"
+            return f"Colour: R={self.colour[0]}, G={self.colour[1]}, B={self.colour[2]}, W={self.colour[3]}"
 
+    #class ColourEvent(Event):
+    #    """Emitted when a new colour measurement is obtained, providing the RGBW values."""
+    #    __slots__ = ("colour", "colour_name",)  # Drops RAM usage to a raw C-pointer array
+    #    def __init__(self, colour: tuple[int, int, int, int], colour_name: str):
+    #        self.colour = colour
+    #        self.colour_name = colour_name
+    #
+    #    def __str__(self):
+    #        return f"Colour: {self.colour_name} (R={self.colour[0]}, G={self.colour[1]}, B={self.colour[2]}, W={self.colour[3]})"
+
+    CAPABILITY_RANGE: int = _EXTENDED_HEADER_FLAG_RANGE_SENSOR
+    CAPABILITY_COLOUR: int = _EXTENDED_HEADER_FLAG_COLOUR_SENSOR
 
     def __init__(self, config: HexpansionConfig | None = None):
         super().__init__()
@@ -225,7 +303,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         self._pwm_setup: bool = False
         self._time_since_last_update: int = 0
         self._outputs_energised: bool = False
-        self.PWMOutput: list[PWM | None] = [None] * _MAX_NUM_CHANNELS
+        self.pwm_outputs: list[PWM | None] = [None] * _MAX_NUM_CHANNELS
         self._freq: list[int] = [0] * _MAX_NUM_CHANNELS
         if self._hexdrive_type.motors > 0:
             self._motor_output: list[int] = [0] * self._hexdrive_type.motors
@@ -247,15 +325,20 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             self._extended_header = ExtendedHexpansionHeader() # create a dummy extended header for non-extended hexdrive types
 
         self._time_since_last_sensor_check: int = 0
-        self._sensor_check_interval: int = _SENSOR_CHECK_INTERVAL_MS
 
         if self._extended_header.flags & _EXTENDED_HEADER_FLAG_RANGE_SENSOR:
-            self._range_sensor: VL53L0X | None = None
+            self._range_events_enabled: bool = False
+            self.range_sensor: VL53L0X | None = None
             self._range_period_ms: int = _DEFAULT_RANGE_PERIOD_MS  # inter-measurement period for continuous ranging (0 = back-to-back / as fast as the sensor allows)
+            # Static allocation of RangeEvent object to avoid allocating new memory for each event dispatch
+            self._cached_range_event: "HexDriveApp.RangeEvent" = self.RangeEvent(0)
 
         if self._extended_header.flags & _EXTENDED_HEADER_FLAG_COLOUR_SENSOR:
-            self._colour_sensor: OPT4060 | None = None
-            self._colour_period_ms: int = 0
+            self._colour_events_enabled: bool = False
+            self.colour_sensor: OPT4060 | None = None
+            self._colour_period_ms: int = _DEFAULT_COLOUR_PERIOD_MS
+            # Static allocation of ColourEvent object to avoid allocating new memory for each event dispatch
+            self._cached_colour_event: "HexDriveApp.ColourEvent" = self.ColourEvent((0,0,0,0))
 
         # LS Pins
         self._power_control: ePin = self.config.ls_pin[_ENABLE_PIN]
@@ -273,6 +356,9 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             self._servo_centre: list[int] = [_SERVO_CENTRE] * self._hexdrive_type.servos
 
         eventbus.on_async(RequestStopAppEvent, self._handle_stop_app, self)
+
+        self._i2c_buffer_32: bytearray = bytearray(32)  # Pre-allocated 32-byte array (only currently used once - so optional to remove it if we want to save 32 bytes of RAM)
+        self._diagnostics: HexDiagnostics = HexDiagnostics()  # For monitoring with a scope
 
         if not self.initialise():
             print("HexDriveApp init failed")
@@ -332,82 +418,89 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
     # do not change the name of this function as it is called by the BadgeOS when the app is removed from memory.
     def deinit(self):
         """ De-initialise all PWM outputs and free up resources. """
-        for _channel, _pwm in enumerate(self.PWMOutput):
+        for _channel, _pwm in enumerate(self.pwm_outputs):
             if _pwm is not None:
                 try:
                     _pwm.deinit()
                 except Exception:       # pylint: disable=broad-except
                     pass
-                self.PWMOutput[_channel] = None
+                self.pwm_outputs[_channel] = None
         for _channel in range(_MAX_NUM_CHANNELS):
             self._freq[_channel] = 0
         self._pwm_setup = False
         if self._extended_header.flags & _EXTENDED_HEADER_FLAG_RANGE_SENSOR:
-            if self._range_sensor is not None:
+            if self.range_sensor is not None:
                 try:
                     self._range_int.irq(handler=None)   # detach the data-ready interrupt handler
-                    self._range_sensor.stop()           # stop continuous ranging
+                    self.range_sensor.stop()           # stop continuous ranging
                 except Exception:       # pylint: disable=broad-except
                     pass
-                self._range_sensor = None
+                self.range_sensor = None
         if self._extended_header.flags & _EXTENDED_HEADER_FLAG_COLOUR_SENSOR:
-            if self._colour_sensor is not None:
+            if self.colour_sensor is not None:
                 try:
                     self._colour_int.irq(handler=None)   # detach the data-ready interrupt handler
-                    self._colour_sensor.stop()           # stop continuous colour sensing
+                    self.colour_sensor.stop()           # stop continuous colour sensing
                 except Exception:       # pylint: disable=broad-except
                     pass
-                self._colour_sensor = None
+                self.colour_sensor = None
 
 
 
     # Special function called by the BadgeOS to allow the app to do any background processing it needs to do.
     # do not change the name of this function as it is called by the BadgeOS in the main loop of the BadgeOS.
+    @micropython.native
     def background_update(self, delta: int):
         """ This is called from the main loop of the BadgeOS to allow the app to do any background processing it needs to do. """
+
+        self._diagnostics.output(3, 1)
+
         self._time_since_last_sensor_check += delta
-        if self._time_since_last_sensor_check > self._sensor_check_interval:  # check sensors every 10ms
+        if self._time_since_last_sensor_check > _SENSOR_CHECK_INTERVAL_MS:  # check sensors every 10ms
             self._time_since_last_sensor_check = 0
             # Check for missed interrupts from the distance sensor and colour sensor and read them if they are ready
+            flags = self._extended_header.flags
+            range_sensor = self.range_sensor
+            colour_sensor = self.colour_sensor
             # Range Sensor
-            if (self._extended_header.flags & _EXTENDED_HEADER_FLAG_RANGE_SENSOR) and self._range_sensor is not None and self._range_sensor.is_continuous:
+            if (flags & _EXTENDED_HEADER_FLAG_RANGE_SENSOR) and range_sensor is not None and range_sensor.is_continuous:
                 if 0 == self._range_int.value():
-                    measurement = self._range_sensor.read()    # reads the measurement and clears the interrupt to re-arm the sensor
-                    if isinstance(measurement, int):
-                        distance = measurement
-                        eventbus.emit(self.RangeEvent(distance))
+                    measurement = range_sensor.read()    # reads the measurement and clears the interrupt to re-arm the sensor
+                    if measurement is not None and self._range_events_enabled:
+                        self._cached_range_event.range = measurement
+                        eventbus.emit(self._cached_range_event)
             # Colour Sensor
-            if (self._extended_header.flags & _EXTENDED_HEADER_FLAG_COLOUR_SENSOR) and self._colour_sensor is not None and self._colour_sensor.is_continuous:
+            if (flags & _EXTENDED_HEADER_FLAG_COLOUR_SENSOR) and colour_sensor is not None and colour_sensor.is_continuous:
                 if 0 == self._led_control.value() or 0 == self._colour_int.value():
                     # Either:
                     #   LED is Off, so we need to poll the colour sensor to see if it has a new reading ready
                     #   or, the colour sensor interrupt is active (low) so we can read the colour sensor
-                    measurement = self._colour_sensor.read()
-                    if measurement is not None:
+                    measurement = colour_sensor.read()
+                    if measurement is not None and self._colour_events_enabled:
                         # we read the colour from the sensor class rather than using the return from read() to keep the linter quiet
-                        colour = self._colour_sensor.colour or (0,0,0,0)
-                        colour_name = self._colour_sensor.colour_name or "Unknown"
-                        eventbus.emit(self.ColourEvent(colour, colour_name))
+                        self._cached_colour_event.colour = measurement
+                        #self._cached_colour_event.colour_name = colour_sensor.colour_name or "Unknown"
+                        eventbus.emit(self._cached_colour_event)
 
         # Keep Alive
-        if not self._pwm_setup or not self._outputs_energised:
-            # if we are not properly initialised then do not attempt to do anything
-            return
-        # Check keep alive period and turn off PWM outputs if exceeded
-        self._time_since_last_update += delta
-        if self._time_since_last_update > self._keep_alive_period:
-            self._time_since_last_update = 0
-            self._outputs_energised = False
-            # First time the keep alive period has expired so report it
-            if self._logging:
-                print(f"D:{self.config.port}:Timeout")
-            for channel,pwm in enumerate(self.PWMOutput):
-                if pwm is not None:
-                    try:
-                        pwm.duty_u16(0)
-                    except Exception as e:          # pylint: disable=broad-except
-                        print(self._pwm_log_string(channel) + f"Off failed {e}")
-                        self.PWMOutput[channel] = None  # Tidy Up
+        if self._pwm_setup and self._outputs_energised:
+            # Check keep alive period and turn off PWM outputs if exceeded
+            self._time_since_last_update += delta
+            if self._time_since_last_update > self._keep_alive_period:
+                self._time_since_last_update = 0
+                self._outputs_energised = False
+                # First time the keep alive period has expired so report it
+                if self._logging:
+                    print(f"D:{self.config.port}:Timeout")
+                for channel,pwm in enumerate(self.pwm_outputs):
+                    if pwm is not None:
+                        try:
+                            pwm.duty_u16(0)
+                        except Exception as e:          # pylint: disable=broad-except
+                            print(self._pwm_log_string(channel) + f"Off failed {e}")
+                            self.pwm_outputs[channel] = None  # Tidy Up
+
+        self._diagnostics.output(3, 0)
 
 
     def get_status(self) -> bool:
@@ -478,12 +571,12 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             physical_channel = None # All channels
 
         # Action new frequency immediately for any channels that are already setup
-        for this_channel, pwm in enumerate(self.PWMOutput):
+        for this_channel, pwm in enumerate(self.pwm_outputs):
             if (physical_channel is None or (this_channel == physical_channel)) and pwm is not None:
                 if freq == 0:
                     # If frequency is set to 0 then we deinit the PWM to free up resources as much as possible
                     pwm.deinit()
-                    self.PWMOutput[this_channel] = None
+                    self.pwm_outputs[this_channel] = None
                     self.config.pin[this_channel].init(mode=Pin.OUT)
                     self.config.pin[this_channel].value(0)
                     if self._logging:
@@ -512,7 +605,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             # position == None -> Turn off PWM (some servos will then turn off, others will stay in last position)
             if channel is None:
                 # channel == None -> Turn off all PWM outputs
-                for ch, pwm in enumerate(self.PWMOutput):
+                for ch, pwm in enumerate(self.pwm_outputs):
                     if pwm is not None and ch in self._servo_pin_map:
                         try:
                             pwm.duty_ns(0)
@@ -526,7 +619,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 return False
             else:
                 physical_channel = self._servo_pin_map[channel]
-                pwm = self.PWMOutput[physical_channel]
+                pwm = self.pwm_outputs[physical_channel]
                 if pwm is None:
                     return False
                 try:
@@ -545,7 +638,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 return False
             physical_channel = self._servo_pin_map[channel]
             pulse_width_in_ns = (self._servo_centre[channel] + position) * 1000 # convert from us to ns
-            if self.PWMOutput[physical_channel] is None:
+            if self.pwm_outputs[physical_channel] is None:
                 # Channel hasn't been setup yet so we need to initialise it from scratch
                 self._freq[channel] = self._freq[channel] if (0 < self._freq[channel]) and (self._freq[channel] <= _MAX_SERVO_FREQ) else _DEFAULT_SERVO_FREQ
                 try:
@@ -556,16 +649,16 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                     pin.init(mode=Pin.IN)
                     pwm = PWM(pin, freq = self._freq[channel])
                     pwm.duty_ns(pulse_width_in_ns)
-                    self.PWMOutput[physical_channel] = pwm
+                    self.pwm_outputs[physical_channel] = pwm
                     if self._logging:
-                        print(self._pwm_log_string(physical_channel) + f"{self.PWMOutput[physical_channel]} init")
+                        print(self._pwm_log_string(physical_channel) + f"{self.pwm_outputs[physical_channel]} init")
                 except Exception as e:      # pylint: disable=broad-except
                     # There are a finite number of PWM resources so it is possible that we run out
                     print(self._pwm_log_string(physical_channel) + f"PWM(init) failed {e}")
                     return False
             else:
                 # Channel is already setup so we just need to change the duty cycle and possibly the frequency if it is too high for the servo
-                pwm = self.PWMOutput[physical_channel]
+                pwm = self.pwm_outputs[physical_channel]
                 if pwm is None:
                     return False
                 try:
@@ -630,20 +723,20 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 continue
             try:
                 # if the output is changing direction then we need to switch which signal is being driven as the PWM output
-                # rather than test for change of direction and also test that PWMOutput to be disabled exists we just do the latter check.
+                # rather than test for change of direction and also test that pwm_outputs to be disabled exists we just do the latter check.
                 output_to_enable  = 3- ((motor<<1) if output > 0 else ((motor<<1)+1))
                 output_to_disable = 3- ((motor<<1)+1 if output > 0 else (motor<<1))
                 # switch off the currently active output before switching the other one on to prevent both outputs being on at the same time
-                pwm_to_disable = self.PWMOutput[output_to_disable]
+                pwm_to_disable = self.pwm_outputs[output_to_disable]
                 if pwm_to_disable is not None:
                     pwm_to_disable.deinit()
-                    self.PWMOutput[output_to_disable] = None
+                    self.pwm_outputs[output_to_disable] = None
                     print(f"D:{self.config.port}:pin{output_to_disable} = 0")
                     self.config.pin[output_to_disable].init(mode=Pin.OUT)
                     self.config.pin[output_to_disable].value(0)
                     if self._logging:
                         print(self._pwm_log_string(output_to_disable) + " disabled")
-                if 0 != output or self.PWMOutput[output_to_enable] is not None:
+                if 0 != output or self.pwm_outputs[output_to_enable] is not None:
                     # if output_to_enable is NOT already active and new output is 0 then we can leave it off for now.
                     # otherwise we need to set the new output value
                     self._set_pwmoutput(output_to_enable, abs(output))
@@ -689,15 +782,15 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             if period_ms == self._range_period_ms:
                 return  # No change needed
             self._range_period_ms = period_ms
-            if self._range_sensor is not None:
-                if self._range_sensor.start(period_ms):
+            if self.range_sensor is not None:
+                if self.range_sensor.start(period_ms):
                     if self._logging:
                         print(f"D:{self.config.port}:Range Sensor period set to {period_ms}ms")
                     return
         raise RuntimeError(f"D:{self.config.port}:Range Sensor period set failed")
 
 
-    def range_enable(self, enable: bool) -> None:
+    def range_enable(self, enable: bool, events: bool = False) -> None:
         """Enable or disable interrupt-driven distance ranging.
 
         When enabled the VL53L0X runs in *continuous* mode: it measures repeatedly on its own and
@@ -707,19 +800,21 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 
         Args:
             enable: True to start ranging, False to stop it and power the sensor down.
+            events: True to enable event dispatching, False to disable it.
         """
         if self._extended_header.flags & _EXTENDED_HEADER_FLAG_RANGE_SENSOR == 0:
             return
         if enable:
-            if self._range_sensor is None:
+            if self.range_sensor is None:
                 if self._i2c is None:
                     self._i2c = I2C(self.config.port)
                     if self._logging:
                         print(f"D:{self.config.port}:i2c init")
-                self._range_sensor = VL53L0X(self._i2c, logging=self._logging)
+                self.range_sensor = VL53L0X(self._i2c, logging=self._logging)
                 if self._logging:
-                    print(f"D:{self.config.port}:Range Sensor created")
-            sensor = self._range_sensor
+                    print(f"D:{self.config.port}:Range Sensor created (events {'enabled' if events else 'disabled'})")
+            self._range_events_enabled = events
+            sensor = self.range_sensor
             # Release the sensor from reset. It needs ~1.2ms to boot before it answers on I2C.
             # This is a one-off setup path (not the periodic update loop) so a short blocking wait
             # here is acceptable and keeps the steady-state ranging fully interrupt driven.
@@ -735,9 +830,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             # the handler is bound its 'self' already carries this app instance (and therefore the
             # sensor object and the flag we set) with it. That is the most efficient way for the
             # interrupt to know the context of the sensor that fired: no module globals, no lookup
-            # tables, no searching - just a direct attribute access. NOTE the handler only sets a flag;
-            # the actual I2C read and RangeEvent emission are deferred to background_update() because
-            # this scheduler context must not touch asyncio (see _handle_range_interrupt).
+            # tables, no searching - just a direct attribute access.
             #
             # We MUST register for BOTH edges. The AW9523B expander interrupts on any change and the
             # badge firmware's C ISR shim (tildagon_pin_isr_handler) schedules whatever Python handler
@@ -754,12 +847,14 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 print(f"D:{self.config.port}:Range Sensor Started")
         else:
             self._range_int.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, handler=None)   # detach the interrupt handler first
-            if self._range_sensor is not None:
-                sensor = self._range_sensor
+            if self.range_sensor is not None:
+                sensor = self.range_sensor
                 sensor.stop()           # stop continuous ranging
                 sensor.reset()          # force a full re-initialisation next time it is enabled
                 if self._logging:
                     print(f"D:{self.config.port}:Range Sensor Stopped")
+                self.range_sensor = None
+                self._range_events_enabled = False
             self.set_range_xshut(False)         # power the sensor down (holds it in hardware reset)
 
 
@@ -770,8 +865,8 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         Returns None until the first reading has been received. New readings arrive automatically
         (via `RangeEvent`) while continuous ranging is enabled with `range_enable`.
         """
-        if (self._extended_header.flags & _EXTENDED_HEADER_FLAG_RANGE_SENSOR) and self._range_sensor is not None:
-            return self._range_sensor.range
+        if (self._extended_header.flags & _EXTENDED_HEADER_FLAG_RANGE_SENSOR) and self.range_sensor is not None:
+            return self.range_sensor.range
         return None
 
 
@@ -795,7 +890,15 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 print(f"D:{self.config.port}:Flood LEDs={'On' if state else 'Off'}")
 
 
-    def colour_enable(self, enable: bool) -> None:
+    @property
+    def flood_led(self) -> bool:
+        """ Return the current state of the flood LED pin. """
+        if self._extended_header.flags & _EXTENDED_HEADER_FLAG_FLOOD_LEDS:
+            return bool(self._led_control.value())
+        return False
+
+
+    def colour_enable(self, enable: bool, events: bool = False) -> None:
         """Enable or disable interrupt-driven colour sensing.
 
         When enabled the OPT4060 runs in *continuous* mode: it measures repeatedly on its own and
@@ -804,19 +907,21 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 
         Args:
             enable: True to start colour sensing, False to stop it and power the sensor down.
+            events: True to enable event dispatching, False to disable it.
         """
         if self._extended_header.flags & _EXTENDED_HEADER_FLAG_COLOUR_SENSOR == 0:
             return
         if enable:
-            if self._colour_sensor is None:
+            if self.colour_sensor is None:
                 if self._i2c is None:
                     self._i2c = I2C(self.config.port)
                     if self._logging:
                         print(f"D:{self.config.port}:i2c init")
-                self._colour_sensor = OPT4060(self._i2c, logging=self._logging)
+                self.colour_sensor = OPT4060(self._i2c, logging=self._logging)
                 if self._logging:
-                    print(f"D:{self.config.port}:Colour Sensor created")
-            sensor = self._colour_sensor
+                    print(f"D:{self.config.port}:Colour Sensor created (events {'enabled' if events else 'disabled'})")
+            sensor = self.colour_sensor
+            self._colour_events_enabled = events
 
             # Register the data-ready interrupt BEFORE starting continuous sensing so that the very
             # first "measurement ready" falling edge cannot be missed.
@@ -835,13 +940,14 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 print(f"D:{self.config.port}:Colour Sensor Started")
         else:
             self._colour_int.irq(trigger=Pin.IRQ_FALLING | Pin.IRQ_RISING, handler=None)   # detach the interrupt handler first
-            if self._colour_sensor is not None:
-                sensor = self._colour_sensor
+            if self.colour_sensor is not None:
+                sensor = self.colour_sensor
                 sensor.stop()           # stop continuous sensing
                 sensor.reset()          # force a full re-initialisation next time it is enabled
                 if self._logging:
                     print(f"D:{self.config.port}:Colour Sensor Stopped")
-
+                self.colour_sensor = None
+                self._colour_events_enabled = False
 
     def set_colour_period(self, period_ms: int) -> None:
         """ Set the inter-measurement period for continuous colour sensing in milliseconds.
@@ -853,36 +959,12 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             if period_ms == self._colour_period_ms:
                 return  # No change needed
             self._colour_period_ms = period_ms
-            if self._colour_sensor is not None:
-                if self._colour_sensor.start(period_ms):
+            if self.colour_sensor is not None:
+                if self.colour_sensor.start(period_ms):
                     if self._logging:
                         print(f"D:{self.config.port}:Colour Sensor period set to {period_ms}ms")
                     return
         raise RuntimeError(f"D:{self.config.port}:Colour Sensor period set failed")
-
-
-    @property
-    def colour(self) -> tuple[int, int, int, int] | None:
-        """Return the most recent colour measurement as a tuple of (R, G, B) values.
-
-        Returns None until the first reading has been received. New readings arrive automatically
-        (via `ColourEvent`) while continuous sensing is enabled with `colour_enable`.
-        """
-        if (self._extended_header.flags & _EXTENDED_HEADER_FLAG_COLOUR_SENSOR) and self._colour_sensor is not None:
-            return self._colour_sensor.colour
-        return None
-
-
-    @property
-    def colour_name(self) -> str | None:
-        """Return the most recent colour measurement as a human-readable name.
-
-        Returns None until the first reading has been received. New readings arrive automatically
-        (via `ColourEvent`) while continuous sensing is enabled with `colour_enable`.
-        """
-        if (self._extended_header.flags & _EXTENDED_HEADER_FLAG_COLOUR_SENSOR) and self._colour_sensor is not None:
-            return self._colour_sensor.colour_name
-        return None
 
 
 #----------------------------------------------------------------
@@ -906,15 +988,17 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
     def _read_extended_hexpansion_header(self) -> ExtendedHexpansionHeader:
         # We use the spare bytes of the first EEPROM sector, after the header, to store a flags
         # which indicates if the distance sensor pins are swapped or not.
-        if self._i2c is None:
+        i2c = self._i2c
+        if i2c is None:
             try:
-                self._i2c = I2C(self.config.port)
+                i2c = I2C(self.config.port)
+                self._i2c = i2c
             except Exception as e:          # pylint: disable=broad-exception-caught
                 print(f"D:{self.config.port}:i2c setup failed {e}")
                 return ExtendedHexpansionHeader(flags=0)  # return a default header with no flags set
         try:
-            extended_header_bytes = self._i2c.readfrom_mem(_ADDR, _EXTENDED_HEADER_ADDR, _EXTENDED_HEADER_SIZE, addrsize=_ADDR_LEN * 8)
-            self._extended_header = ExtendedHexpansionHeader.from_bytes(extended_header_bytes)
+            i2c.readfrom_mem_into(_ADDR, _EXTENDED_HEADER_ADDR, self._i2c_buffer_32, addrsize=_ADDR_LEN * 8)
+            self._extended_header = ExtendedHexpansionHeader.from_bytes(self._i2c_buffer_32)
         except Exception as e:          # pylint: disable=broad-exception-caught
             print(f"D:{self.config.port}:extended header read failed {e}")
             self._extended_header = ExtendedHexpansionHeader(flags=0)  # return a default header with no flags set
@@ -925,15 +1009,17 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         # we know that on our EEPROM the extended header is stored in the first sector after the main header, so we
         # can write it directly to that location and it all fits wihtin the page size of the EEPROM so we don't need to worry about chunking it up.
         # the bytes in this EEPROM space must be blank (0xFF) before we write to it, otherwise the write will fail.
-        if self._i2c is None:
+        i2c = self._i2c
+        if i2c is None:
             try:
-                self._i2c = I2C(self.config.port)
+                i2c = I2C(self.config.port)
+                self._i2c = i2c
             except Exception as e:          # pylint: disable=broad-exception-caught
                 print(f"D:{self.config.port}:i2c setup failed {e}")
                 return False
         try:
             header_bytes = header.to_bytes()
-            self._i2c.writeto_mem(_ADDR, _EXTENDED_HEADER_ADDR, header_bytes, addrsize=_ADDR_LEN * 8)
+            i2c.writeto_mem(_ADDR, _EXTENDED_HEADER_ADDR, header_bytes, addrsize=_ADDR_LEN * 8)
             return True
         except Exception as e:          # pylint: disable=broad-exception-caught
             print(f"D:{self.config.port}:extended header write failed {e}")
@@ -946,21 +1032,21 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         if _duty_cycle < 0 or _duty_cycle > 65535:
             return False
         try:
-            if self.PWMOutput[_channel] is None:
+            if self.pwm_outputs[_channel] is None:
                 # Channel hasn't been setup yet so we need to initialise it from scratch
                 pin = self.config.pin[_channel]
                 if self._logging:
-                    print(self._pwm_log_string(_channel) + f"{self.PWMOutput[_channel]} init ... pin={pin}")
+                    print(self._pwm_log_string(_channel) + f"{self.pwm_outputs[_channel]} init ... pin={pin}")
                 # Micropython v1.28 generates a spurious warning when we try to initialise a PWM on a pin that was previously used.
                 # "W (557771) ledc: GPIO 47 is not usable, maybe conflict with others"
                 # workaround is to set it to an input
                 pin.init(mode=Pin.IN)
                 pwm = PWM(pin, freq = self._freq[_channel])
                 pwm.duty_u16(_duty_cycle)
-                self.PWMOutput[_channel] = pwm
+                self.pwm_outputs[_channel] = pwm
                 if self._logging:
-                    print(self._pwm_log_string(_channel) + f"{self.PWMOutput[_channel]} init")
-            pwm = self.PWMOutput[_channel]
+                    print(self._pwm_log_string(_channel) + f"{self.pwm_outputs[_channel]} init")
+            pwm = self.pwm_outputs[_channel]
             if pwm is None:
                 return False
             if _duty_cycle != pwm.duty_u16():
@@ -1106,6 +1192,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         return False
 
 
+    @micropython.native
     def _handle_range_interrupt(self, _pin):
         """Distance-sensor data-ready interrupt handler (a *bound* method - see `range_enable`).
 
@@ -1116,15 +1203,16 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             _pin: the LS pin object that fired (supplied by the scheduler, unused - the bound 'self'
                 already identifies the sensor).
         """
+        self._diagnostics.output(3, 1)
 
         # check the actual state of the interrupt pin to avoid spurious rising-edge callbacks (see `range_enable`).
-        if  0 != self._range_int.value() or self._range_sensor is None:
-            return
-        measurement = self._range_sensor.read()    # reads the measurement and clears the interrupt to re-arm the sensor
-        if isinstance(measurement, int):
-            distance = measurement
-            eventbus.emit(self.RangeEvent(distance))
+        if  0 == self._range_int.value():
+            measurement = self.range_sensor.read()    # reads the measurement and clears the interrupt to re-arm the sensor
+            if measurement is not None and self._range_events_enabled:
+                self._cached_range_event.range = measurement
+                eventbus.emit(self._cached_range_event)
 
+        self._diagnostics.output(3, 0)
 
 
 #---------------------------------------------------------------------------------
@@ -1133,6 +1221,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 # PRIVATE methods
 #---------------------------------------------------------------------------------
 
+    @micropython.native
     def _handle_colour_interrupt(self, _pin):
         """Colour-sensor data-ready interrupt handler (a *bound* method - see `colour_enable`).
 
@@ -1144,16 +1233,17 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 already identifies the sensor).
         """
 
-        # check the actual state of the interrupt pin to avoid spurious rising-edge callbacks (see `colour_enable`).
-        if 0 != self._colour_int.value() or self._colour_sensor is None:
-            return
-        measurement = self._colour_sensor.read()
-        if measurement is not None:
-            # we read the colour from the sensor class rather than using the return from read() to keep the linter quiet
-            colour = self._colour_sensor.colour or (0,0,0,0)
-            colour_name = self._colour_sensor.colour_name or "Unknown"
-            eventbus.emit(self.ColourEvent(colour, colour_name))
+        self._diagnostics.output(3, 1)
 
+        # check the actual state of the interrupt pin to avoid spurious rising-edge callbacks (see `colour_enable`).
+        if 0 == self._colour_int.value():
+            colour_sensor = self.colour_sensor
+            measurement = colour_sensor.read()  # reads the measurement and clears the interrupt to re-arm the sensor
+            if measurement is not None and self._colour_events_enabled:
+                self._cached_colour_event.colour = measurement
+                eventbus.emit(self._cached_colour_event)
+
+        self._diagnostics.output(3, 0)
 
 
 """
@@ -1171,6 +1261,8 @@ Each concrete driver must implement:
 
 class SensorBase:
     """Abstract base class for BadgeBot I2C sensor drivers."""
+    __slots__ = ("_i2c", "_ready", "_i2c_addr", "_logging", "_continuous", "_period_ms", "_sequence", "_i2c_buffer_1", "_i2c_buffer_2")
+
     # Sub-classes must override these
     I2C_ADDR = 0x00
     READ_INTERVAL_MS = 250
@@ -1179,12 +1271,15 @@ class SensorBase:
 
 
     def __init__(self, i2c: I2C, i2c_addr: int, logging: bool = False):
-        self._i2c = i2c
-        self._ready = False
-        self._i2c_addr = i2c_addr
-        self._logging = logging
-        self._continuous = False
-        self._period_ms = 0
+        self._i2c: I2C = i2c
+        self._ready: bool = False
+        self._i2c_addr: int = i2c_addr
+        self._logging: bool = logging
+        self._continuous: bool = False
+        self._period_ms: int = 0
+        self._sequence: int = 0
+        self._i2c_buffer_1: bytearray = bytearray(1)
+        self._i2c_buffer_2: bytearray = bytearray(2)
 
 
     # ------------------------------------------------------------------
@@ -1262,7 +1357,10 @@ class SensorBase:
         if not self._ready:
             return None
         try:
-            return self._read()
+            result = self._read()
+            if result is not None:
+                self._sequence += 1
+            return result
         except Exception as e:          # pylint: disable=broad-exception-caught
             print(f"D:{self.NAME} read error: {e}")
             return None
@@ -1276,7 +1374,13 @@ class SensorBase:
         """
         self._ready = False
         self._continuous = False
+        self._sequence = 0
 
+
+    @property
+    def sequence(self) -> int:
+        """Return the current measurement sequence number (incremented on each read)."""
+        return self._sequence
 
     @property
     def is_ready(self) -> bool:
@@ -1337,7 +1441,8 @@ class SensorBase:
     # ------------------------------------------------------------------
 
     def _read_u8(self, reg: int) -> int:
-        return self._i2c.readfrom_mem(self._i2c_addr, reg, 1)[0]
+        self._i2c.readfrom_mem_into(self._i2c_addr, reg, self._i2c_buffer_1)
+        return self._i2c_buffer_1[0]
 
 
     def _write_u8(self, reg: int, value: int) -> None:
@@ -1345,8 +1450,8 @@ class SensorBase:
 
 
     def _read_u16_be(self, reg: int) -> int:
-        d = self._i2c.readfrom_mem(self._i2c_addr, reg, 2)
-        return (d[0] << 8) | d[1]
+        self._i2c.readfrom_mem_into(self._i2c_addr, reg, self._i2c_buffer_2)
+        return (self._i2c_buffer_2[0] << 8) | self._i2c_buffer_2[1]
 
 
     def _read_s16_be(self, reg: int) -> int:
@@ -1444,6 +1549,8 @@ _DEFAULT_TUNING_SETTINGS = (
 
 class VL53L0X(SensorBase):
     """VL53L0X Time-of-Flight distance sensor driver."""
+    __slots__ = ("_stop_variable", "_last_range_mm", "_i2c_buffer_6")
+
     I2C_ADDR = _RANGE_I2C_ADDRESS
     NAME = "VL53L0X"
     TYPE = "Distance"
@@ -1451,10 +1558,9 @@ class VL53L0X(SensorBase):
 
     def __init__(self, i2c: I2C, logging: bool = False):
         super().__init__(i2c=i2c, i2c_addr=self.I2C_ADDR, logging=logging)
-        self._continuous = False            # True while continuous (interrupt-driven) ranging is active
-        self._stop_variable = 0             # used to store the stop variable value for the VL53L0X sensor
-        self._last_range_mm = 0             # last range reading in mm
-
+        self._stop_variable: int = 0             # used to store the stop variable value for the VL53L0X sensor
+        self._last_range_mm: int = 0             # last range reading in mm
+        self._i2c_buffer_6: bytearray = bytearray(6)  # buffer for reading/writing 6 bytes at a time
 
     @property
     def range(self) -> int:
@@ -1475,8 +1581,6 @@ class VL53L0X(SensorBase):
         if not self._check_id():
             return False
 
-        self._continuous = False
-
         # The VL53L0X needs a substantial startup sequence before single-shot
         # ranging becomes trustworthy;
         self._write_u8(
@@ -1496,7 +1600,8 @@ class VL53L0X(SensorBase):
             return False
 
         spad_count, spad_type_is_aperture = spad_info
-        ref_spad_map = bytearray(self._i2c.readfrom_mem(self._i2c_addr, _GLOBAL_CONFIG_SPAD_ENABLES_REF_0, 6))
+        self._i2c.readfrom_mem_into(self._i2c_addr, _GLOBAL_CONFIG_SPAD_ENABLES_REF_0, self._i2c_buffer_6)
+        ref_spad_map = self._i2c_buffer_6
         self._write_u8(0xFF, 0x01)
         self._write_u8(_DYNAMIC_SPAD_REF_EN_START_OFFSET, 0x00)
         self._write_u8(_DYNAMIC_SPAD_NUM_REQUESTED_REF_SPAD, 0x2C)
@@ -1593,7 +1698,6 @@ class VL53L0X(SensorBase):
         `start`/`init` re-runs the full initialisation sequence.
         """
         self._ready = False
-        self._continuous = False
         self._last_range_mm = 0
 
 
@@ -1649,7 +1753,7 @@ class VL53L0X(SensorBase):
         while (self._read_u8(_RESULT_INTERRUPT_STATUS) & _INTERRUPT_READY_MASK) == 0:
             if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
                 return False
-            time.sleep_ms(1)
+            time.sleep_ms(10)
         return True
 
 
@@ -1680,7 +1784,7 @@ class VL53L0X(SensorBase):
         while self._read_u8(_SPAD_POLL_REG) == 0x00:
             if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
                 return None
-            time.sleep_ms(1)
+            time.sleep_ms(10)
 
         self._write_u8(_SPAD_POLL_REG, 0x01)
         spad_info = self._read_u8(_SPAD_INFO_REG)
@@ -1723,33 +1827,33 @@ _COLOUR_I2C_ADDRESS = const(0x44)
 
 
 # ── Register addresses (16-bit big-endian) ──────────────────────────────────
-_REG_RED_MSB        = 0x00   # Red channel MSB (exponent[15:12] | mantissa_hi[11:0])
-_REG_RED_LSB        = 0x01   # Red channel LSB (mantissa_lo[15:8] | counter[7:4] | crc[3:0])
-_REG_GREEN_MSB      = 0x02   # Green channel MSB
-_REG_GREEN_LSB      = 0x03   # Green channel LSB
-_REG_BLUE_MSB       = 0x04   # Blue channel MSB
-_REG_BLUE_LSB       = 0x05   # Blue channel LSB
-_REG_CLEAR_MSB      = 0x06   # Clear / White channel MSB
-_REG_CLEAR_LSB      = 0x07   # Clear / White channel LSB
-_REG_THRESH_LO      = 0x08   # Low threshold
-_REG_THRESH_HI      = 0x09   # High threshold
-_REG_CONFIG         = 0x0A   # Configuration register
-_REG_INT_CTRL       = 0x0B   # Interrupt / threshold configuration
-_REG_RES_CTRL       = 0x0C   # Result control / status flags
-_REG_DEVICE_ID      = 0x11   # Device ID (expect 0x0821, lower 12 bits = 0x821)
+_REG_RED_MSB        = const(0x00)   # Red channel MSB (exponent[15:12] | mantissa_hi[11:0])
+_REG_RED_LSB        = const(0x01)   # Red channel LSB (mantissa_lo[15:8] | counter[7:4] | crc[3:0])
+_REG_GREEN_MSB      = const(0x02)   # Green channel MSB
+_REG_GREEN_LSB      = const(0x03)   # Green channel LSB
+_REG_BLUE_MSB       = const(0x04)   # Blue channel MSB
+_REG_BLUE_LSB       = const(0x05)   # Blue channel LSB
+_REG_CLEAR_MSB      = const(0x06)   # Clear / White channel MSB
+_REG_CLEAR_LSB      = const(0x07)   # Clear / White channel LSB
+_REG_THRESH_LO      = const(0x08)   # Low threshold
+_REG_THRESH_HI      = const(0x09)   # High threshold
+_REG_CONFIG         = const(0x0A)   # Configuration register
+_REG_INT_CTRL       = const(0x0B)   # Interrupt / threshold configuration
+_REG_RES_CTRL       = const(0x0C)   # Result control / status flags
+_REG_DEVICE_ID      = const(0x11)   # Device ID (expect 0x0821, lower 12 bits = 0x821)
 
 # ── Device identification ────────────────────────────────────────────────────
-_DEVICE_ID_MASK     = 0x0FFF   # Lower 12 bits contain device ID
-_DEVICE_ID_EXPECT   = 0x0821   # Same value as OPT4048 — distinguish by channel content
+_DEVICE_ID_MASK     = const(0x0FFF)   # Lower 12 bits contain device ID
+_DEVICE_ID_EXPECT   = const(0x0821)   # Same value as OPT4048 — distinguish by channel content
 
 # ── Data register bit masks (per 16-bit register) ───────────────────────────
 # MSB register  [15:12] exponent, [11:0] mantissa_hi
 # LSB register  [15:8]  mantissa_lo, [7:4] sample counter, [3:0] CRC
-_DATA_EXPONENT_MASK  = 0xF000   # Bits 15:12 of MSB register
-_DATA_MSB_MASK       = 0x0FFF   # Bits 11:0  of MSB register (mantissa high)
-_DATA_LSB_MASK       = 0xFF00   # Bits 15:8  of LSB register (mantissa low)
-_DATA_COUNTER_MASK   = 0x00F0   # Bits 7:4   of LSB register (sample counter)
-_DATA_CRC_MASK       = 0x000F   # Bits 3:0   of LSB register (CRC)
+_DATA_EXPONENT_MASK  = const(0xF000)   # Bits 15:12 of MSB register
+_DATA_MSB_MASK       = const(0x0FFF)   # Bits 11:0  of MSB register (mantissa high)
+_DATA_LSB_MASK       = const(0xFF00)   # Bits 15:8  of LSB register (mantissa low)
+_DATA_COUNTER_MASK   = const(0x00F0)   # Bits 7:4   of LSB register (sample counter)
+_DATA_CRC_MASK       = const(0x000F)   # Bits 3:0   of LSB register (CRC)
 
 # ── CONFIG register (0x0A) bit layout (16-bit big-endian) ────────────────────
 # Bit 15      : QWAKE   — quick wake from standby
@@ -1760,53 +1864,60 @@ _DATA_CRC_MASK       = 0x000F   # Bits 3:0   of LSB register (CRC)
 # Bit 3       : INT_LATCH  — 1 = latch interrupt until status is read
 # Bit 2       : INT_POL    — interrupt pin polarity (0 = active-low)
 # Bits 1-0    : FAULT_COUNT — number of out-of-range results before interrupt
-_CFG_QWAKE_MASK      = 0x8000   # Bit 15
-_CFG_RANGE_MASK      = 0x3C00   # Bits 13:10
-_CFG_CONV_TIME_MASK  = 0x03C0   # Bits 9:6
-_CFG_OPER_MODE_MASK  = 0x0030   # Bits 5:4
-_CFG_INT_LATCH_MASK  = 0x0008   # Bit 3
-_CFG_INT_POL_MASK    = 0x0004   # Bit 2
-_CFG_FAULT_CNT_MASK  = 0x0003   # Bits 1:0
+_CFG_QWAKE_MASK      = const(0x8000)   # Bit 15
+_CFG_RANGE_MASK      = const(0x3C00)   # Bits 13:10
+_CFG_CONV_TIME_MASK  = const(0x03C0)   # Bits 9:6
+_CFG_OPER_MODE_MASK  = const(0x0030)   # Bits 5:4
+_CFG_INT_LATCH_MASK  = const(0x0008)   # Bit 3
+_CFG_INT_POL_MASK    = const(0x0004)   # Bit 2
+_CFG_FAULT_CNT_MASK  = const(0x0003)   # Bits 1:0
 
 # Range constants (RANGE field, bits 13:10)
-RANGE_2K        = 0    # ~2.2 klux full scale
-RANGE_4K        = 1    # ~4.5 klux
-RANGE_9K        = 2    # ~9 klux
-RANGE_18K       = 3    # ~18 klux
-RANGE_36K       = 4    # ~36 klux
-RANGE_72K       = 5    # ~72 klux
-RANGE_144K      = 6    # ~144 klux
-RANGE_AUTO      = 12   # Automatic range selection
+_RANGE_2K        = const(0)    # ~2.2 klux full scale
+_RANGE_4K        = const(1)    # ~4.5 klux
+_RANGE_9K        = const(2)    # ~9 klux
+_RANGE_18K       = const(3)    # ~18 klux
+_RANGE_36K       = const(4)    # ~36 klux
+_RANGE_72K       = const(5)    # ~72 klux
+_RANGE_144K      = const(6)    # ~144 klux
+_RANGE_AUTO      = const(12)   # Automatic range selection
 
 # Conversion time constants (CONVERSION_TIME field, per channel)
-CONV_600US      = 0    # 600 µs
-CONV_1MS        = 1    # 1 ms
-CONV_1_8MS      = 2    # 1.8 ms
-CONV_3_4MS      = 3    # 3.4 ms
-CONV_6_5MS      = 4    # 6.5 ms
-CONV_12_7MS     = 5    # 12.7 ms
-CONV_25MS       = 6    # 25 ms
-CONV_50MS       = 7    # 50 ms
-CONV_100MS      = 8    # 100 ms
-CONV_200MS      = 9    # 200 ms
-CONV_400MS      = 10   # 400 ms
-CONV_800MS      = 11   # 800 ms
+_CONV_600US      = const(0)    # 600 µs
+_CONV_1MS        = const(1)    # 1 ms
+_CONV_1_8MS      = const(2)    # 1.8 ms
+_CONV_3_4MS      = const(3)    # 3.4 ms
+_CONV_6_5MS      = const(4)    # 6.5 ms
+_CONV_12_7MS     = const(5)    # 12.7 ms
+_CONV_25MS       = const(6)    # 25 ms
+_CONV_50MS       = const(7)    # 50 ms
+_CONV_100MS      = const(8)    # 100 ms
+_CONV_200MS      = const(9)    # 200 ms
+_CONV_400MS      = const(10)   # 400 ms
+_CONV_800MS      = const(11)   # 800 ms
+
+# Per-channel conversion time (microseconds) indexed by the CONVERSION_TIME code
+# (0-11) written into _REG_CONFIG. All four channels convert back-to-back, so the
+# all-channel measurement time is 4 x these values.
+_CONV_TIME_US = (600, 1000, 1800, 3400, 6500, 12700, 25000, 50000, 100000, 200000, 400000, 800000)
+_NUM_COLOUR_CHANNELS = const(4)   # R, G, B, Clear converted back-to-back per cycle
+_CONV_TIME_TOLERANCE_MS = const(2)  # requested-period vs conversion-time mismatch ignored below this
 
 # Operating mode constants (OPERATING_MODE field, bits 5:4)
-MODE_POWERDOWN  = 0    # Power-down
-MODE_FORCED     = 1    # Forced (auto-range one-shot)
-MODE_ONE_SHOT   = 2    # Single conversion then power-down
-MODE_CONTINUOUS = 3    # Continuous conversion
+_MODE_POWERDOWN  = const(0)    # Power-down
+_MODE_FORCED     = const(1)    # Forced (auto-range one-shot)
+_MODE_ONE_SHOT   = const(2)    # Single conversion then power-down
+_MODE_CONTINUOUS = const(3)    # Continuous conversion
 
 # Interrupt polarity constants
-INT_POL_ACTIVE_LOW  = 0
-INT_POL_ACTIVE_HIGH = 1
+_INT_POL_ACTIVE_LOW  = const(0)
+_INT_POL_ACTIVE_HIGH = const(1)
 
 # Fault count constants (number of faults before interrupt)
-FAULT_COUNT_1   = 0
-FAULT_COUNT_2   = 1
-FAULT_COUNT_4   = 2
-FAULT_COUNT_8   = 3
+_FAULT_COUNT_1   = const(0)
+_FAULT_COUNT_2   = const(1)
+_FAULT_COUNT_4   = const(2)
+_FAULT_COUNT_8   = const(3)
 
 # ── INT_CTRL register (0x0B) bit layout ──────────────────────────────────────
 # Bit 15-7    : reserved
@@ -1846,17 +1957,122 @@ _RES_CTRL_FLAG_H_MASK      = const(0x0002)   # Bit 1
 _RES_CTRL_FLAG_L_MASK      = const(0x0001)   # Bit 0
 
 _WHITE_CAL_SCALE = const(4096)
+_DEFAULT_WHITE_GAINS = (10, 7, 20, 2)
+
+
+# --- Define Unique Integer IDs for Colours ---
+ID_BLACK   = const(0)
+ID_WHITE   = const(1)
+ID_GRAY    = const(2)
+ID_RED     = const(3)
+ID_ORANGE  = const(4)
+ID_YELLOW  = const(5)
+ID_GREEN   = const(6)
+ID_CYAN    = const(7)
+ID_BLUE    = const(8)
+ID_MAGENTA = const(9)
+
+@micropython.viper
+def _lookup_colour_math_viper(r: int, g: int, b: int, clear: int) -> int:
+    """Bare-metal Viper math processor for fast HSV mapping."""
+    # Inline max calculation to bypass standard Python max() function
+    max_c = r
+    if g > max_c: max_c = g
+    if b > max_c: max_c = b
+
+    if max_c == 0:
+        return ID_BLACK
+
+    # Inline min calculation to bypass standard Python min() function
+    min_c = r
+    if g < min_c: min_c = g
+    if b < min_c: min_c = b
+
+    delta = max_c - min_c
+
+    # Saturation (0 – 100)
+    s = (100 * delta) // max_c
+
+    # --- Achromatic branch (low saturation) ---
+    if s < 20:
+        brightness_ref = clear if clear > 0 else max_c
+        reflectance = 0
+        if brightness_ref > 0:
+            reflectance = (100 * max_c) // brightness_ref
+
+        if reflectance < 15:
+            return ID_BLACK
+        if reflectance > 65:
+            return ID_WHITE
+        return ID_GRAY
+
+    # --- Chromatic branch: compute hue (0 – 3600) ---
+    h = 0
+    if max_c == r:
+        # Note: Viper handles modulo (%) on positive integers best.
+        # Adding a safe upper boundary ensures value is positive before mod.
+        h = 6 * ((((100 * (g - b)) // delta) + 600) % 600)
+    elif max_c == g:
+        h = 6 * (((100 * (b - r)) // delta) + 200)
+    else:
+        h = 6 * (((100 * (r - g)) // delta) + 400)
+
+    # Hue classification
+    if h < 200 or h >= 3400:
+        return ID_RED
+    if h < 450:
+        return ID_ORANGE
+    if h < 700:
+        return ID_YELLOW
+    if h < 1500:
+        return ID_GREEN
+    if h < 2000:
+        return ID_CYAN
+    if h < 2600:
+        return ID_BLUE
+    return ID_MAGENTA
+
+
+class ColourLookup:
+    """Static class for mapping RGBW tuples to colour names via Viper math."""
+    # A simple pre-allocated tuple table for indexing the IDs
+    # Since these are alphanumeric, mpy-cross automatically interns them!
+    _COLOUR_TABLE = (
+        _COLOUR_BLACK,   # ID 0
+        _COLOUR_WHITE,   # ID 1
+        _COLOUR_GRAY,    # ID 2
+        _COLOUR_RED,     # ID 3
+        _COLOUR_ORANGE,  # ID 4
+        _COLOUR_YELLOW,  # ID 5
+        _COLOUR_GREEN,   # ID 6
+        _COLOUR_CYAN,    # ID 7
+        _COLOUR_BLUE,    # ID 8
+        _COLOUR_MAGENTA  # ID 9
+    )
+
+    @staticmethod
+    def rgbw_to_str(colour: tuple[int, int, int, int]) -> str:
+        """User-facing entry point that bridges tuples to native Viper math."""
+        # Unpack the tuple cleanly into 4 distinct integers
+        r, g, b, clear = colour
+
+        # Fire the hardware-accelerated Viper calculation engine
+        colour_id = _lookup_colour_math_viper(r, g, b, clear)
+
+        # Instantly resolve the ID code back to an interned string token
+        return ColourLookup._COLOUR_TABLE[colour_id]
 
 
 class OPT4060(SensorBase):
     """OPT4060 Colour Sensor driver.
-
     Returns four 20-bit ADC values:
       "red"   — Red channel
       "green" — Green channel
       "blue"  — Blue channel
       "w"     — Clear / White channel
     """
+    __slots__ = ("_overload", "_last_colour", "_calibrated", "_black_reference", "_white_reference", "_white_gains", "_i2c_buffer_16", "_conversion_time")
+
 
     I2C_ADDR = _COLOUR_I2C_ADDRESS
     NAME = "OPT4060"
@@ -1866,13 +2082,15 @@ class OPT4060(SensorBase):
 
     def __init__(self, i2c: I2C, logging: bool = False):
         super().__init__(i2c=i2c, i2c_addr=self.I2C_ADDR, logging=logging)
-        self._continuous = False            # True while continuous (interrupt-driven) sensing is active
-        self._overload = False              # True if the last reading was saturated/overflowed
+        self._overload: bool = False              # True if the last reading was saturated/overflowed
         self._last_colour: tuple[int, int, int, int] | None = None  # Last RGBC reading
-        self._last_colour_name: str | None = None  # Last colour name (from lookup)
-        self._white_gains: tuple[float, float, float, float] = (10.0, 7.0, 20.0, 2.0)  # white reference gains for RGBC channels, scaled by _WHITE_CAL_SCALE
+        self._calibrated: bool = False
         self._black_reference: tuple[int, int, int, int] | None = None  # Black reference RGBC values
         self._white_reference: tuple[int, int, int, int] | None = None  # White reference RGBC values
+        self._white_gains: tuple[int, int, int, int] = _DEFAULT_WHITE_GAINS # white reference gains for RGBC channels, scaled by _WHITE_CAL_SCALE
+        self._i2c_buffer_16: bytearray = bytearray(16)  # Pre-allocated 16-byte array
+        self._conversion_time: int = 0                  # Conversion time in milliseconds
+
 
     @property
     def overload(self) -> bool:
@@ -1889,7 +2107,44 @@ class OPT4060(SensorBase):
     @property
     def colour_name(self) -> str | None:
         """Return the last colour name (from lookup), or None if no reading yet."""
-        return self._last_colour_name
+        if self._last_colour is None:
+            return None
+        calibrated_colour = self.apply_white_reference(self._last_colour)
+        return ColourLookup.rgbw_to_str(calibrated_colour)
+
+
+    @property
+    def calibrated(self) -> bool:
+        """True if both black and white references have been set."""
+        return self._calibrated
+
+
+    @calibrated.setter
+    def calibrated(self, value: bool) -> None:
+        """Set the calibrated state. If set to False, clears the black and white references."""
+        if not value:
+            self._black_reference = None
+            self._white_reference = None
+            self._white_gains = _DEFAULT_WHITE_GAINS
+            self._calibrated = False
+            print("D:Calibration cleared, using default gains")
+        else:
+            # only allowed to set to False - must be set True by performing calibration
+            raise ValueError("Cannot set calibrated to True directly.")
+
+
+    @property
+    def white_gains(self) -> tuple[int, int, int, int]:
+        """Return the current white reference gains for RGBC channels."""
+        return self._white_gains
+
+
+    @white_gains.setter
+    def white_gains(self, gains: tuple[int, int, int, int]) -> None:
+        """Set the white reference gains for RGBC channels."""
+        self._white_gains = gains
+        self._calibrated = True
+        print(f"D:White gains set to: {self._white_gains}")
 
 
     @property
@@ -1899,13 +2154,8 @@ class OPT4060(SensorBase):
 
 
     @black_reference.setter
-    def black_reference(self, colour: tuple[int, int, int, int] | None = None) -> None:
-        """Capture the current RGBC reading as the black reference.
-           If no colour is provided, use the last RGBC reading."""
-        if colour is None:
-            colour = self._last_colour
-        if colour is None:
-            return
+    def black_reference(self, colour: tuple[int, int, int, int]) -> None:
+        """Capture the current RGBC reading as the black reference."""
         self._black_reference = colour
         print(f"D:Black reference: r={colour[0]}, g={colour[1]}, b={colour[2]}, w={colour[3]}")
 
@@ -1917,26 +2167,18 @@ class OPT4060(SensorBase):
 
 
     @white_reference.setter
-    def white_reference(self, colour: tuple[int, int, int, int] | None = None) -> bool:
-        """Capture the current RGBC reading as the white reference and compute gains.
-           If no colour is provided, use the last RGBC reading."""
-        if colour is None:
-            colour = self._last_colour
-        if colour is None:
-            return False
-
+    def white_reference(self, colour: tuple[int, int, int, int]) -> None:
+        """Capture the current RGBC reading as the white reference and compute gains."""
         self._white_reference = colour
         print(f"D:White reference: r={colour[0]}, g={colour[1]}, b={colour[2]}, w={colour[3]}")
-
         if self._black_reference is None:
             self._black_reference = (0, 0, 0, 0)
-
         self._white_gains = self._reference_to_gains(self._black_reference, self._white_reference)
-
+        self._calibrated = True
         print(f"D:gains: {self._white_gains}")
-        return True
 
 
+    @micropython.native
     def apply_white_reference(self, colour: tuple[int, int, int, int] | None = None) -> tuple[int, int, int, int]:
         """Apply white reference gains to raw RGBC values and return adjusted RGBC tuple."""
         if colour is None:
@@ -1959,75 +2201,10 @@ class OPT4060(SensorBase):
         )
 
 
-    @staticmethod
-    def lookup_colour_RGB(colour: tuple[int, int, int, int]) -> str:
-        """Identifies a color name from raw RGB channel readings using HSV colour space.
-
-        HSV naturally separates chromatic colour (hue) from achromatic attributes
-        (saturation and brightness), giving more accurate named-colour matching
-        than projecting R/G/B onto the CIE xy diagram.
-
-        Parameters:
-            colour  : raw channel values (any consistent scale — need not be 0-255).
-                      optional broadband clear-channel reading from the same sensor.
-                      When provided it is used as a brightness reference to distinguish
-                      Black from Gray from White in low-saturation scenes.
-        """
-        r, g, b, clear = colour
-
-        max_c = max(r, g, b)
-        if max_c == 0:
-            return "Black"
-
-        min_c = min(r, g, b)
-        delta = max_c - min_c
-
-        # Saturation (0.0 – 1.0): how far from grey the colour is
-        s = delta / max_c
-
-        # --- Achromatic branch (low saturation) ---
-        if s < 0.20:
-            # Use the clear channel as a brightness reference when available;
-            # otherwise fall back to max_c compared to the channel ceiling.
-            brightness_ref = clear if clear > 0 else max_c
-            if brightness_ref > 0:
-                reflectance = max_c / brightness_ref
-            else:
-                reflectance = 0.0
-            if reflectance < 0.15:
-                return "Black"
-            if reflectance > 0.65:
-                return "White"
-            return "Gray"
-
-        # --- Chromatic branch: compute hue (0 – 360°) ---
-        if max_c == r:
-            h = 60.0 * (((g - b) / delta) % 6)
-        elif max_c == g:
-            h = 60.0 * ((b - r) / delta + 2)
-        else:
-            h = 60.0 * ((r - g) / delta + 4)
-
-        if h < 20 or h >= 340:
-            return "Red"
-        if h < 45:
-            return "Orange"
-        if h < 70:
-            return "Yellow"
-        if h < 150:
-            return "Green"
-        if h < 200:
-            return "Cyan"
-        if h < 260:
-            return "Blue"
-        return "Magenta"
-
-
     def _init(self) -> bool:
         if not self._check_id():
             return False
 
-        self._continuous = False
         self._overload = False
 
         # Configure for fast continuous reads within ~10 ms budget:
@@ -2037,8 +2214,12 @@ class OPT4060(SensorBase):
         #   INT latch   : latched (bit 3 = 1)
         #   INT polarity: active-low (bit 2 = 0)
         #   Fault count : 1 (bits 1:0 = 0)
-        cfg = (RANGE_AUTO << 10) | (CONV_1_8MS << 6) | (MODE_CONTINUOUS << 4) | _CFG_INT_LATCH_MASK
+        cfg = (_RANGE_AUTO << 10) | (_CONV_1_8MS << 6) | (_MODE_CONTINUOUS << 4) | _CFG_INT_LATCH_MASK
         self._write_u16_be(_REG_CONFIG, cfg)
+
+        # Cache the all-channel conversion time (ms) for the default config above so
+        # that _start() can decide whether the requested period needs a different one.
+        self._conversion_time = (_CONV_TIME_US[_CONV_1_8MS] * _NUM_COLOUR_CHANNELS + 999) // 1000
 
         # Use latched interrupt mode so the CONV_READY flag stays set long enough
         # to be reliably sampled — the non-latched pulse is only ~1 µs wide.
@@ -2050,25 +2231,33 @@ class OPT4060(SensorBase):
     def _start(self) -> bool:
         """Start continuous (interrupt-driven) colour sensing.
 
-        In continuous mode the sensor measures repeatedly on its own and asserts its interrupt line
-        each time a new reading is ready; call `read` from the interrupt handler to retrieve the value
-        and re-arm the sensor.
+        In continuous mode the sensor measures all four channels back-to-back on its own and asserts
+        its interrupt line each time a set of readings is ready; call `read` from the interrupt handler
+        to retrieve the value and re-arm the sensor.
 
-        TODO - take notice of the period_ms parameter and set the inter-measurement period register accordingly.
+        The requested inter-measurement period (`_period_ms`) is met by choosing the longest per-channel
+        conversion time whose all-channel total still fits within it, so any spare time is spent on
+        longer integration for a less noisy reading. The CONVERSION_TIME field is only reprogrammed when
+        the request differs from the current setting by more than `_CONV_TIME_TOLERANCE_MS`, avoiding
+        needless I2C traffic (and there is no software timer to service).
 
         Returns:
             True on success, False on failure.
         """
-        # Enable continuous mode (see datasheet section 7.3.1)
-        self._write_u8(0x00, 0x01)  # MODE = 1 (continuous)
+        if abs(self._period_ms - self._conversion_time) > _CONV_TIME_TOLERANCE_MS:
+            self._set_conversion_time(self._best_conversion_time(self._period_ms))
+        # Enter continuous conversion mode; the sensor re-arms itself and asserts INT as each set of
+        # channel readings completes for the interrupt handler to service.
+        self._set_mode(_MODE_CONTINUOUS)
         self._write_u8(0x01, 0x00)  # INT = 0 (interrupt on every sample)
         self._write_u8(0x02, 0x00)  # INTCLR = 0 (clear interrupt)
+
         return True
 
 
     def _stop(self) -> bool:
         """Stop continuous sensing and return the sensor to idle. Returns success or failure."""
-        self._set_mode(MODE_POWERDOWN)
+        self._set_mode(_MODE_POWERDOWN)
         return True
 
 
@@ -2080,7 +2269,8 @@ class OPT4060(SensorBase):
             self._overload = bool(st & _RES_CTRL_OVERLOAD_MASK)
 
             # Burst-read all 4 channels (8 registers × 2 bytes = 16 bytes)
-            raw = self._i2c.readfrom_mem(self._i2c_addr, _REG_RED_MSB, 16)
+            self._i2c.readfrom_mem_into(self._i2c_addr, _REG_RED_MSB, self._i2c_buffer_16)
+            raw = bytes(self._i2c_buffer_16)
 
             r = self._decode_channel(raw, 0)
             g = self._decode_channel(raw, 4)
@@ -2088,8 +2278,8 @@ class OPT4060(SensorBase):
             w = self._decode_channel(raw, 12)
 
             self._last_colour = (r, g, b, w)
-            calibrated_colour = self.apply_white_reference(self._last_colour)
-            self._last_colour_name = self.lookup_colour_RGB(calibrated_colour)
+            #calibrated_colour = self.apply_white_reference(self._last_colour)
+            #self._last_colour_name = ColourLookup.rgbw_to_str(calibrated_colour)
             return r, g, b, w
         return None
 
@@ -2137,6 +2327,37 @@ class OPT4060(SensorBase):
 
 
     @staticmethod
+    def _best_conversion_time(period_ms: int) -> int:
+        """Return the per-channel CONVERSION_TIME code (0-11) whose all-channel time
+        best fills `period_ms` without exceeding it.
+
+        All four channels convert back-to-back, so the all-channel time is
+        4 x the per-channel conversion time. The longest per-channel time that still
+        fits the requested period is chosen so spare time improves accuracy; if the
+        period is shorter than even the fastest setting, the fastest (code 0) is used.
+        """
+        budget_us = period_ms * 1000
+        conv_code = 0
+        for code, per_channel_us in enumerate(_CONV_TIME_US):
+            if per_channel_us * _NUM_COLOUR_CHANNELS <= budget_us:
+                conv_code = code
+            else:
+                break
+        return conv_code
+
+
+    def _set_conversion_time(self, conv_code: int) -> None:
+        """Write the per-channel CONVERSION_TIME field (code 0-11) into _REG_CONFIG,
+        preserving the other fields, and cache the resulting all-channel time (ms)."""
+        cfg = self._read_u16_be(_REG_CONFIG)
+        cfg = (cfg & ~_CFG_CONV_TIME_MASK) | ((conv_code & 0x0F) << 6)
+        self._write_u16_be(_REG_CONFIG, cfg)
+        self._conversion_time = (_CONV_TIME_US[conv_code] * _NUM_COLOUR_CHANNELS + 999) // 1000
+        print(f"D:Setting conversion time code {conv_code} ({_CONV_TIME_US[conv_code]} µs per channel) = {self._conversion_time} ms total")
+
+
+    @staticmethod
+    @micropython.native
     def _decode_channel(buf: bytes, offset: int) -> int:
         """Decode a single channel from a 4-byte (MSB+LSB register) slice.
 
@@ -2157,17 +2378,18 @@ class OPT4060(SensorBase):
 
 
     @staticmethod
-    def _reference_to_gains(black: tuple[int, int, int, int], white: tuple[int, int, int, int]) -> tuple[float, float, float, float]:
+    @micropython.native
+    def _reference_to_gains(black: tuple[int, int, int, int], white: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
         ref_r = max(white[0] - black[0], 1)
         ref_g = max(white[1] - black[1], 1)
         ref_b = max(white[2] - black[2], 1)
         ref_w = max(white[3] - black[3], 1) if white[3] > 0 else _WHITE_CAL_SCALE
         gain_scale = _WHITE_CAL_SCALE * _WHITE_CAL_SCALE
         return (
-            (gain_scale + (ref_r // 2)) / ref_r,
-            (gain_scale + (ref_g // 2)) / ref_g,
-            (gain_scale + (ref_b // 2)) / ref_b,
-            (gain_scale + (ref_w // 2)) / ref_w,
+            (gain_scale + (ref_r // 2)) // ref_r,
+            (gain_scale + (ref_g // 2)) // ref_g,
+            (gain_scale + (ref_b // 2)) // ref_b,
+            (gain_scale + (ref_w // 2)) // ref_w,
         )
 
 __app_export__ = HexDriveApp
