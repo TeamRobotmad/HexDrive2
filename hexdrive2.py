@@ -39,7 +39,7 @@ _ALT_RANGE_INT_PIN = const(4)   # Some models of the VL52L0X sensor module have 
 _ALT_RANGE_XSHUT_PIN = const(3) # Some models of the VL52L0X sensor module have the interrupt and XSHUT pins swapped
 
 _RANGE_SENSOR_XSHUT_RESPONSE_TIME_MS = const(20)  # Time to wait after changing the XSHUT pin state before the sensor is ready to respond to I2C commands
-_SENSOR_CHECK_INTERVAL_MS = const(20)  # Interval to check for new sensor readings in continuous mode (ms) - as a fallback in case the interrupts are missed
+_SENSOR_CHECK_INTERVAL_MS = const(100)  # Interval to check for new sensor readings in continuous mode (ms) - as a fallback in case the interrupts are missed
 
 # Hexpansion EEPROM constants
 _ADDR_LEN = const(2)          # EEPROM I2C address length in bytes (1 or 2)
@@ -454,6 +454,8 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             self.colour_sensor = None
 
 
+    # For unknown reason using this task completely breaks the colour sensor - the background_update is never called, but if magically
+    # restarts when the colour sensor is disabled. So for now we just call background_update() from the main loop of the BadgeOS instead of using a background task.
     #@micropython.native
     #async def background_task(self):
     #    """Background task loop for handling time-based updates. This runs independently of the main update/draw loop
@@ -486,17 +488,18 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 if measurement is not None and self._range_events_enabled:
                     self._cached_range_event.range = measurement
                     eventbus.emit(self._cached_range_event)
-        if not self._colour_interrupt_enabled:
-            # Colour Sensor
-            colour_sensor = self.colour_sensor
-            if colour_sensor is not None and colour_sensor.is_continuous:
-                # Checking the state of the colour sensor interrupt pin takes I2C communication with the AW9523 chip,
-                # so we may aswell assume it is active and use the I2C time to read the status register of the sensor instead.
-                measurement = colour_sensor.read()
-                if measurement is not None and self._colour_events_enabled:
-                    # we read the colour from the sensor class rather than using the return from read() to keep the linter quiet
-                    self._cached_colour_event.colour = measurement
-                    eventbus.emit(self._cached_colour_event)
+        # Currently never using interrupts for the colour sensor as it is not reliable on some modules, so we just poll it in the background update loop
+        #if not self._colour_interrupt_enabled:
+        # Colour Sensor
+        colour_sensor = self.colour_sensor
+        if colour_sensor is not None and colour_sensor.is_continuous:
+            # Checking the state of the colour sensor interrupt pin takes I2C communication with the AW9523 chip,
+            # so we may aswell assume it is active and use the I2C time to read the status register of the sensor instead.
+            measurement = colour_sensor.read()
+            if measurement is not None and self._colour_events_enabled:
+                # we read the colour from the sensor class rather than using the return from read() to keep the linter quiet
+                self._cached_colour_event.colour = measurement
+                eventbus.emit(self._cached_colour_event)
 
         # Keep Alive
         if self._pwm_setup and self._outputs_energised:
@@ -2016,16 +2019,20 @@ ID_CYAN    = const(7)
 ID_BLUE    = const(8)
 ID_MAGENTA = const(9)
 
+
+#viper not currently in use so we can return a tupple
 #@micropython.viper
-def _lookup_colour_math_viper(r: int, g: int, b: int, clear: int) -> int:
+def _lookup_colour_math_viper(r: int, g: int, b: int, clear: int) -> tuple[int, int]:
     """Bare-metal Viper math processor for fast HSV mapping."""
+    h = 1200 # default hue for achromatic (gray) colours
+
     # Inline max calculation to bypass standard Python max() function
     max_c = r
     if g > max_c: max_c = g
     if b > max_c: max_c = b
 
     if max_c == 0:
-        return ID_BLACK
+        return ID_BLACK, h
 
     # Inline min calculation to bypass standard Python min() function
     min_c = r
@@ -2037,6 +2044,17 @@ def _lookup_colour_math_viper(r: int, g: int, b: int, clear: int) -> int:
     # Saturation (0 – 100)
     s = (100 * delta) // max_c
 
+    # --- Chromatic branch: compute hue (0 – 3600) ---
+    if s > 0:
+        if max_c == r:
+            # Note: Viper handles modulo (%) on positive integers best.
+            # Adding a safe upper boundary ensures value is positive before mod.
+            h = 6 * ((((100 * (g - b)) // delta) + 600) % 600)
+        elif max_c == g:
+            h = 6 * (((100 * (b - r)) // delta) + 200)
+        else:
+            h = 6 * (((100 * (r - g)) // delta) + 400)
+
     # --- Achromatic branch (low saturation) ---
     if s < 20:
         brightness_ref = clear if clear > 0 else max_c
@@ -2045,37 +2063,27 @@ def _lookup_colour_math_viper(r: int, g: int, b: int, clear: int) -> int:
             reflectance = (100 * max_c) // brightness_ref
 
         if reflectance < 15:
-            return ID_BLACK
+            return ID_BLACK, 0
         if reflectance > 65:
-            return ID_WHITE
-        return ID_GRAY
+            return ID_WHITE, 0
+        return ID_GRAY, 0
 
     # --- Chromatic branch: compute hue (0 – 3600) ---
-    h = 0
-    if max_c == r:
-        # Note: Viper handles modulo (%) on positive integers best.
-        # Adding a safe upper boundary ensures value is positive before mod.
-        h = 6 * ((((100 * (g - b)) // delta) + 600) % 600)
-    elif max_c == g:
-        h = 6 * (((100 * (b - r)) // delta) + 200)
-    else:
-        h = 6 * (((100 * (r - g)) // delta) + 400)
 
     # Hue classification
     if h < 200 or h >= 3400:
-        return ID_RED
+        return ID_RED, h
     if h < 450:
-        return ID_ORANGE
+        return ID_ORANGE, h
     if h < 700:
-        return ID_YELLOW
+        return ID_YELLOW, h
     if h < 1500:
-        return ID_GREEN
+        return ID_GREEN, h
     if h < 2000:
-        return ID_CYAN
+        return ID_CYAN, h
     if h < 2600:
-        return ID_BLUE
-    return ID_MAGENTA
-
+        return ID_BLUE, h
+    return ID_MAGENTA, h
 
 class ColourLookup:
     """Static class for mapping RGBW tuples to colour names via Viper math."""
@@ -2095,16 +2103,16 @@ class ColourLookup:
     )
 
     @staticmethod
-    def rgbw_to_str(colour: tuple[int, int, int, int]) -> str:
+    def rgbw_to_str(colour: tuple[int, int, int, int]) -> tuple[str, int]:
         """User-facing entry point that bridges tuples to native Viper math."""
         # Unpack the tuple cleanly into 4 distinct integers
         r, g, b, clear = colour
 
         # Fire the hardware-accelerated Viper calculation engine
-        colour_id = _lookup_colour_math_viper(r, g, b, clear)
+        colour_id, hue = _lookup_colour_math_viper(r, g, b, clear)
 
         # Instantly resolve the ID code back to an interned string token
-        return ColourLookup._COLOUR_TABLE[colour_id]
+        return ColourLookup._COLOUR_TABLE[colour_id], hue
 
 
 class OPT4060(SensorBase):
@@ -2115,7 +2123,7 @@ class OPT4060(SensorBase):
       "blue"  — Blue channel
       "w"     — Clear / White channel
     """
-    __slots__ = ("_overload", "_last_colour", "_calibrated", "_black_reference", "_white_reference", "_white_gains", "_i2c_buffer_16", "_i2c_read_buffer_2", "_conversion_time", "_interrupts")
+    __slots__ = ("_overload", "_last_colour", "_last_colour_hue", "_calibrated", "_black_reference", "_white_reference", "_white_gains", "_i2c_buffer_16", "_i2c_read_buffer_2", "_conversion_time", "_interrupts")
 
 
     I2C_ADDR = _COLOUR_I2C_ADDRESS
@@ -2126,8 +2134,9 @@ class OPT4060(SensorBase):
 
     def __init__(self, i2c: I2C, logging: bool = False, interrupts: bool = False):
         super().__init__(i2c=i2c, i2c_addr=self.I2C_ADDR, logging=logging)
-        self._overload: bool = False              # True if the last reading was saturated/overflowed
+        self._overload: bool = False                    # True if the last reading was saturated/overflowed
         self._last_colour: tuple[int, int, int, int] | None = None  # Last RGBC reading
+        self._last_colour_hue: int = 0                  # Last colour hue (0-3600)
         self._calibrated: bool = False
         self._black_reference: tuple[int, int, int, int] | None = None  # Black reference RGBC values
         self._white_reference: tuple[int, int, int, int] | None = None  # White reference RGBC values
@@ -2156,7 +2165,16 @@ class OPT4060(SensorBase):
         if self._last_colour is None:
             return None
         calibrated_colour = self.apply_white_reference(self._last_colour)
-        return ColourLookup.rgbw_to_str(calibrated_colour)
+        colour_name, hue = ColourLookup.rgbw_to_str(calibrated_colour)
+        self._last_colour_hue = hue  # Store the hue for potential future use
+        return colour_name
+
+
+    @property
+    # You must get the colour name first to ensure the hue is calculated and stored
+    def colour_hue(self) -> int | None:
+        """Return the last colour hue (0-3600)"""
+        return self._last_colour_hue
 
 
     @property
