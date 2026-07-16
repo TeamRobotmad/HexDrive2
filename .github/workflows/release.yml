@@ -1,0 +1,46 @@
+# Publishes hexdrive2.py to our TeamRobotmad/hexpansion-firmwares fork on
+# every push to main, by pushing directly to that fork's main branch.
+
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync-firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout HexDrive2
+        uses: actions/checkout@v4
+        with:
+          path: hexdrive2
+
+      - name: Checkout hexpansion-firmwares fork
+        uses: actions/checkout@v4
+        with:
+          repository: TeamRobotmad/hexpansion-firmwares
+          path: hexpansion-firmwares
+          token: ${{ secrets.HEXPANSION_FIRMWARES_PAT }}
+
+      - name: Sync app.py into hexpansion-firmwares fork
+        run: |
+          cp hexdrive2/hexdrive2.py hexpansion-firmwares/0xcbcb/0x10c8/app.py
+
+      - name: Commit and push to our fork
+        working-directory: hexpansion-firmwares
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add 0xcbcb/0x10c8/app.py
+          if git diff --cached --quiet; then
+            echo "No changes to sync."
+            exit 0
+          fi
+          git commit -m "Update HexDrive2 firmware (0xcbcb/0x10c8)" -m "Synced from TeamRobotmad/HexDrive2@${{ github.sha }}"
+          git push origin main
