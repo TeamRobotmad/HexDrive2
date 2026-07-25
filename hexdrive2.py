@@ -26,7 +26,7 @@ from tildagon import Pin as ePin
 import micropython
 
 # Define the minimum BadgeOS version required to run this app (e.g. if we need features that are only available in a certain version of BadgeOS)
-_MIN_BADGEOS_VERSION = [2, 0, 0]     # v2.0.0 is required to be able to use the new hexpansion utilites
+_MIN_BADGEOS_VERSION = [2, 2, 0]     # v2.2.0 is required to be able to use the new hexpansion utilites
 
 # HexDrive Hexpansion constants
 # Hardware defintions:
@@ -39,7 +39,7 @@ _ALT_RANGE_INT_PIN = const(4)   # Some models of the VL52L0X sensor module have 
 _ALT_RANGE_XSHUT_PIN = const(3) # Some models of the VL52L0X sensor module have the interrupt and XSHUT pins swapped
 
 _RANGE_SENSOR_XSHUT_RESPONSE_TIME_MS = const(20)  # Time to wait after changing the XSHUT pin state before the sensor is ready to respond to I2C commands
-_SENSOR_CHECK_INTERVAL_MS = const(100)  # Interval to check for new sensor readings in continuous mode (ms) - as a fallback in case the interrupts are missed
+#_SENSOR_CHECK_INTERVAL_MS = const(100)  # Interval to check for new sensor readings in continuous mode (ms) - as a fallback in case the interrupts are missed
 
 # Hexpansion EEPROM constants
 _ADDR_LEN = const(2)          # EEPROM I2C address length in bytes (1 or 2)
@@ -60,8 +60,6 @@ _EXTENDED_HEADER_FLAG_RANGE_PINS_SWAPPED  = const(0x4000)  # Flag indicating tha
 _EXTENDED_HEADER_FLAG_INITIALISED         = const(0x8000)  # Flag indicating that the extended header has been initialised
 
 
-
-
 # Default values and limits:
 _DEFAULT_PWM_FREQ = const(20000)           # 20kHz is a good default for motors as it is above the audible range for most people and works with most motors and ESCs
 _DEFAULT_SERVO_FREQ = const(50)            # 50Hz = 20mS period
@@ -78,7 +76,7 @@ _MAX_SERVO_RANGE = const(1400)             # 1400us either side of centre (VERY 
 _SERVO_MAX_TRIM  = const(1000)             # 1000us either side of centre for trimming the centre position
 
 
-# Colour Sensor Descriptive Constants
+# Colour Sensor Descriptive Constants - keep in sync with the colour sensor ID values in the colour sensor driver
 _COLOUR_BLACK  = "Black"
 _COLOUR_WHITE  = "White"
 _COLOUR_RED    = "Red"
@@ -235,16 +233,16 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         "config", "_logging", "_i2c", "_i2c_buffer_32", "_hexdiag","_hexdrive_type",
         "_keep_alive_period", "_power_state", "_pwm_setup",
         "_time_since_last_update", "_outputs_energised",
-        "pwm_outputs", "_freq", "_motor_output", "_extended_header",
+        "pwm_outputs", "_pwm_init","_freq", "_motor_output", "_extended_header",
         "_time_since_last_sensor_check",
         "range_sensor", "_range_period_ms", "colour_sensor",
         "_colour_period_ms", "_power_control", "_led_control",
         "_colour_int", "_range_xshut", "_range_int", "_servo_pin_map",
         "_servo_centre", "_cached_range_event", "_cached_colour_event",
         "_range_events_enabled", "_range_interrupt_enabled",
-        "_colour_events_enabled", "_colour_interrupt_enabled","background_update_period",)
+        "_colour_events_enabled", "_colour_interrupt_enabled") # ,"background_update_period",)
 
-    VERSION = 2         # Increment this when making changes to the app that require the hexpansion EEPROM app to be re-flashed with the new code.
+    VERSION = 3         # Increment this when making changes to the app that require the hexpansion EEPROM app to be re-flashed with the new code.
 
 
     class RangeEvent(Event):
@@ -304,6 +302,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         self._time_since_last_update: int = 0
         self._outputs_energised: bool = False
         self.pwm_outputs: list[PWM | None] = [None] * _MAX_NUM_CHANNELS
+        self._pwm_init: list[bool] = [False] * _MAX_NUM_CHANNELS
         self._freq: list[int] = [0] * _MAX_NUM_CHANNELS
         if self._hexdrive_type.motors > 0:
             self._motor_output: list[int] = [0] * self._hexdrive_type.motors
@@ -352,7 +351,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             self._range_xshut:   ePin = self.config.ls_pin[_ALT_RANGE_XSHUT_PIN if self._extended_header.flags & _EXTENDED_HEADER_FLAG_RANGE_PINS_SWAPPED else _RANGE_XSHUT_PIN]
             self._range_int:     ePin = self.config.ls_pin[_ALT_RANGE_INT_PIN if self._extended_header.flags & _EXTENDED_HEADER_FLAG_RANGE_PINS_SWAPPED else _RANGE_INT_PIN]
 
-        self.background_update_period: int = _SENSOR_CHECK_INTERVAL_MS
+        #self.background_update_period: int = _SENSOR_CHECK_INTERVAL_MS
 
         # Servo related
         if self._hexdrive_type.servos > 0:
@@ -374,6 +373,10 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 
     def initialise(self) -> bool:
         """Initialise the app - return True if successful, False if failed."""
+
+        # If currently initialised, deinitialise first to free up resources
+        if self._pwm_setup:
+            self.deinit()
 
         # Initialise HS Pins
         for _, hs_pin in enumerate(self.config.pin):
@@ -423,12 +426,13 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
     def deinit(self):
         """ De-initialise all PWM outputs and free up resources. """
         for _channel, _pwm in enumerate(self.pwm_outputs):
-            if _pwm is not None:
+            if _pwm is not None and self._pwm_init[_channel]:
                 try:
+                    print(self._pwm_log_string(_channel) + "deinit")
                     _pwm.deinit()
+                    self._pwm_init[_channel] = False
                 except Exception:       # pylint: disable=broad-except
                     pass
-                self.pwm_outputs[_channel] = None
         for _channel in range(_MAX_NUM_CHANNELS):
             self._freq[_channel] = 0
         self._pwm_setup = False
@@ -474,14 +478,18 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
     def background_update(self, delta: int):
         """ This is called from the main loop of the BadgeOS to allow the app to do any background processing it needs to do. """
 
-        self._hexdiag.output(3, 1)
-        self._hexdiag.output(0, 1)
+        #self._hexdiag.output(3, 1)
+        #self._hexdiag.output(0, 1)
+        diag_output = False
 
         # To be robust against missed interrupts from the distance sensor and colour sensor we read them here even if interrupts are in use
         if not self._range_interrupt_enabled:
             # Range Sensor
             range_sensor = self.range_sensor
             if range_sensor is not None and range_sensor.is_continuous:
+                self._hexdiag.output(3, 1)
+                self._hexdiag.output(0, 1)
+                diag_output = True
                 # Checking the state of the range sensor interrupt pin takes I2C communication with the AW9523 chip,
                 # so we may aswell assume it is active and use the I2C time to read the status register of the sensor instead.
                 measurement = range_sensor.read()    # reads the measurement and clears the interrupt to re-arm the sensor
@@ -493,6 +501,10 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         # Colour Sensor
         colour_sensor = self.colour_sensor
         if colour_sensor is not None and colour_sensor.is_continuous:
+            if not diag_output:
+                self._hexdiag.output(3, 1)
+                self._hexdiag.output(0, 1)
+                diag_output = True
             # Checking the state of the colour sensor interrupt pin takes I2C communication with the AW9523 chip,
             # so we may aswell assume it is active and use the I2C time to read the status register of the sensor instead.
             measurement = colour_sensor.read()
@@ -514,13 +526,17 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 for channel,pwm in enumerate(self.pwm_outputs):
                     if pwm is not None:
                         try:
-                            pwm.duty_u16(0)
+                            if self._pwm_init[channel]:
+                                pwm.duty_u16(0)
                         except Exception as e:          # pylint: disable=broad-except
                             print(self._pwm_log_string(channel) + f"Off failed {e}")
                             self.pwm_outputs[channel] = None  # Tidy Up
+                            self._pwm_init[channel] = False
+                            self._freq[channel] = 0
 
-        self._hexdiag.output(3, 0)
-        self._hexdiag.output(0, 0)
+        if diag_output:
+            self._hexdiag.output(3, 0)
+            self._hexdiag.output(0, 0)
 
 
     def get_status(self) -> bool:
@@ -594,16 +610,28 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         for this_channel, pwm in enumerate(self.pwm_outputs):
             if (physical_channel is None or (this_channel == physical_channel)) and pwm is not None:
                 if freq == 0:
-                    # If frequency is set to 0 then we deinit the PWM to free up resources as much as possible
-                    pwm.deinit()
-                    self.pwm_outputs[this_channel] = None
-                    self.config.pin[this_channel].init(mode=Pin.OUT)
-                    self.config.pin[this_channel].value(0)
-                    if self._logging:
-                        print(self._pwm_log_string(this_channel) + " disabled")
+                    if self._freq[this_channel] != 0:
+                        # If frequency is set to 0 then we deinit the PWM to free up resources as much as possible
+                        if self._pwm_init[this_channel]:
+                            pwm.deinit()
+                            self._pwm_init[this_channel] = False
+                            if self._logging:
+                                print(self._pwm_log_string(this_channel) + "deinit")
+                        self._freq[this_channel] = 0
+                        self.config.pin[this_channel].init(mode=Pin.OUT)
+                        self.config.pin[this_channel].value(0)
+                        if self._logging:
+                            print(self._pwm_log_string(this_channel) + f"pin{this_channel}=Off")
                 else:
                     try:
-                        pwm.freq(freq)
+                        if self._freq[this_channel]:
+                            if not self._pwm_init[this_channel]:
+                                pwm.init(freq=freq)
+                                self._pwm_init[this_channel] = True
+                                if self._logging:
+                                    print(self._pwm_log_string(this_channel) + "init")
+                            else:
+                                pwm.freq(freq)
                         if self._logging:
                             print(self._pwm_log_string(this_channel) + f"{freq}Hz set")
                     except Exception as e:  # pylint: disable=broad-except
@@ -626,7 +654,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             if channel is None:
                 # channel == None -> Turn off all PWM outputs
                 for ch, pwm in enumerate(self.pwm_outputs):
-                    if pwm is not None and ch in self._servo_pin_map:
+                    if pwm is not None and ch in self._servo_pin_map and self._pwm_init[ch]:
                         try:
                             pwm.duty_ns(0)
                         except Exception as e:  # pylint: disable=broad-except
@@ -640,7 +668,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             else:
                 physical_channel = self._servo_pin_map[channel]
                 pwm = self.pwm_outputs[physical_channel]
-                if pwm is None:
+                if pwm is None or self._pwm_init[physical_channel] is False:
                     return False
                 try:
                     pwm.duty_ns(0)
@@ -664,14 +692,13 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 try:
                     # Micropython v1.28 generates a spurious warning when we try to initialise a PWM on a pin that was previously used.
                     # "W (557771) ledc: GPIO 47 is not usable, maybe conflict with others"
-                    # workaround is to set it to an input
                     pin = self.config.pin[physical_channel]
-                    pin.init(mode=Pin.IN)
                     pwm = PWM(pin, freq = self._freq[channel])
                     pwm.duty_ns(pulse_width_in_ns)
                     self.pwm_outputs[physical_channel] = pwm
+                    self._pwm_init[physical_channel] = True
                     if self._logging:
-                        print(self._pwm_log_string(physical_channel) + f"{self.pwm_outputs[physical_channel]} init")
+                        print(self._pwm_log_string(physical_channel) + f"{self.pwm_outputs[physical_channel]} created")
                 except Exception as e:      # pylint: disable=broad-except
                     # There are a finite number of PWM resources so it is possible that we run out
                     print(self._pwm_log_string(physical_channel) + f"PWM(init) failed {e}")
@@ -682,6 +709,11 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 if pwm is None:
                     return False
                 try:
+                    if not self._pwm_init[physical_channel]:
+                        pwm.init(freq=self._freq[channel])
+                        self._pwm_init[physical_channel] = True
+                        if self._logging:
+                            print(self._pwm_log_string(physical_channel) + f"{self.pwm_outputs[physical_channel]} init")
                     if _MAX_SERVO_FREQ < pwm.freq():
                         # Ensure the frequency is suitable for use with Servos
                         # otherwise the pulse width will not be accepted
@@ -695,11 +727,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 # Scale servo position to PWM duty cycle (500-2500us)
                 try:
                     if 2000 < abs(pulse_width_in_ns - pwm.duty_ns()):    # allow tolerance of 2us to avoid unnecessary updates
-                        #if self._logging:
-                        #    print(self._pwm_log_string(physical_channel) + f"{pulse_width_in_ns}ns")
                         pwm.duty_ns(pulse_width_in_ns)
-                        #if self._logging:
-                        #    print(self._pwm_log_string(physical_channel) + f"{pwm} duty")
                 except Exception as e:          # pylint: disable=broad-except
                     print(self._pwm_log_string(physical_channel) + f"set duty failed {e}")
                     return False
@@ -744,19 +772,29 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             try:
                 # if the output is changing direction then we need to switch which signal is being driven as the PWM output
                 # rather than test for change of direction and also test that pwm_outputs to be disabled exists we just do the latter check.
-                output_to_enable  = 3- ((motor<<1) if output > 0 else ((motor<<1)+1))
+                # if the output is actaully going to be 0 then it doesn't matter which output is enabled or disabled as both will be set to 0 anyway.
+                output_to_enable  = 3- ((motor<<1)   if output > 0 else ((motor<<1)+1))
                 output_to_disable = 3- ((motor<<1)+1 if output > 0 else (motor<<1))
-                # switch off the currently active output before switching the other one on to prevent both outputs being on at the same time
-                pwm_to_disable = self.pwm_outputs[output_to_disable]
-                if pwm_to_disable is not None:
-                    pwm_to_disable.deinit()
-                    self.pwm_outputs[output_to_disable] = None
-                    print(f"D:{self.config.port}:pin{output_to_disable} = 0")
-                    self.config.pin[output_to_disable].init(mode=Pin.OUT)
-                    self.config.pin[output_to_disable].value(0)
-                    if self._logging:
-                        print(self._pwm_log_string(output_to_disable) + " disabled")
-                if 0 != output or self.pwm_outputs[output_to_enable] is not None:
+                if 0 != output:
+                    # if the new output is not 0 then we need to switch the active output to the new one
+                    # switch off the currently active output before switching the other one on to prevent both outputs being on at the same time
+                    pwm_to_disable = self.pwm_outputs[output_to_disable]
+                    if pwm_to_disable is not None and self._pwm_init[output_to_disable]:
+                        pwm_to_disable.deinit()
+                        self._pwm_init[output_to_disable] = False
+                        if self._logging:
+                            print(self._pwm_log_string(output_to_disable) + " deinit")
+                        self.config.pin[output_to_disable].init(mode=Pin.OUT)
+                        self.config.pin[output_to_disable].value(0)
+                        print(f"D:{self.config.port}:pin{output_to_disable}=Off")
+                else:
+                    # if the new output is 0 then we can just switch off the currently active output and leave the other one off for now.
+                    pwm_to_switch_off = self.pwm_outputs[output_to_disable]
+                    if pwm_to_switch_off is not None and self._pwm_init[output_to_disable]:
+                        pwm_to_switch_off.duty_u16(0)
+                        print(f"D:{self.config.port}:pin{output_to_disable}=0 duty")
+
+                if 0 != output or self._pwm_init[output_to_enable]:
                     # if output_to_enable is NOT already active and new output is 0 then we can leave it off for now.
                     # otherwise we need to set the new output value
                     self._set_pwmoutput(output_to_enable, abs(output))
@@ -979,13 +1017,13 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                     if self._logging:
                         print(f"D:{self.config.port}:Colour Sensor period set to {period_ms}ms")
                     return
-        raise RuntimeError(f"D:{self.config.port}:Colour Sensor period set failed")
+                raise RuntimeError(f"D:{self.config.port}:Colour Sensor period set failed")
 
 
 #----------------------------------------------------------------
 # PRIVATE ASYNC methods
 #----------------------------------------------------------------
-    async def _handle_stop_app(self, event):
+    async def _handle_stop_app(self, event: RequestStopAppEvent):
         """ Handle the RequestStopAppEvent so that we can release resources """
         try:
             if event.app == self:
@@ -995,10 +1033,14 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 # The badge HexpansionManagerApp tidies up the LS and HS pins when a hexpansion app is removed
         except (AttributeError, TypeError):
             pass
+        eventbus.remove(RequestStopAppEvent, self._handle_stop_app, self)
+        eventbus.remove(HexpansionInsertionEvent, self._handle_hexpansion_change_event, self)
+        eventbus.remove(HexpansionRemovalEvent, self._handle_hexpansion_change_event, self)
 
 
     async def _handle_hexpansion_change_event(self, event):
         """ Handle the HexpansionInsertion/RemovalEvent so that we can check for HexDiag. """
+        _ = event
         self._hexdiag.init()
 
 
@@ -1055,24 +1097,29 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             if self.pwm_outputs[_channel] is None:
                 # Channel hasn't been setup yet so we need to initialise it from scratch
                 pin = self.config.pin[_channel]
-                if self._logging:
-                    print(self._pwm_log_string(_channel) + f"{self.pwm_outputs[_channel]} init ... pin={pin}")
                 # Micropython v1.28 generates a spurious warning when we try to initialise a PWM on a pin that was previously used.
                 # "W (557771) ledc: GPIO 47 is not usable, maybe conflict with others"
-                # workaround is to set it to an input
-                pin.init(mode=Pin.IN)
                 pwm = PWM(pin, freq = self._freq[_channel])
                 pwm.duty_u16(_duty_cycle)
                 self.pwm_outputs[_channel] = pwm
+                self._pwm_init[_channel] = True
                 if self._logging:
-                    print(self._pwm_log_string(_channel) + f"{self.pwm_outputs[_channel]} init")
+                    print(self._pwm_log_string(_channel) + f"{self.pwm_outputs[_channel]} created")
             pwm = self.pwm_outputs[_channel]
             if pwm is None:
+                print(self._pwm_log_string(_channel) + f"pwm_outputs[{_channel}] is None!!!")
                 return False
+            if self._pwm_init[_channel] is False:
+                pwm.init(freq=self._freq[_channel])
+                self._pwm_init[_channel] = True
+                if self._logging:
+                    print(self._pwm_log_string(_channel) + f"{self.pwm_outputs[_channel]} init")
             if _duty_cycle != pwm.duty_u16():
                 pwm.duty_u16(_duty_cycle)
                 if self._logging:
                     print(self._pwm_log_string(_channel) + f"{_duty_cycle}")
+            else:
+                print(self._pwm_log_string(_channel) + f"{_duty_cycle} (no change)")
         except Exception as e:              # pylint: disable=broad-except
             print(self._pwm_log_string(_channel) + f"set {_duty_cycle} failed {e}")
             return False
@@ -2019,12 +2066,29 @@ ID_CYAN    = const(7)
 ID_BLUE    = const(8)
 ID_MAGENTA = const(9)
 
+# --- Define Thresholds for Achromatic Colours ---
+# Achromatic colours are defined by low saturation and low reflectance.
+_ACHROMATIC_SATURATION_THRESHOLD = const(20)  # Saturation below this is considered achromatic
+_ACHROMATIC_REFLECTANCE_LOW_THRESHOLD = const(15)  # Reflectance below this is considered black
+_ACHROMATIC_REFLECTANCE_HIGH_THRESHOLD = const(65)  # Reflectance above this is considered white
+
+
+# --- Chromatic Thresholds ---
+# Chromatic colours are defined by higher saturation and specific hue ranges.
+HUE_RED_MAX = const(200)           # Red is anything below this or above the magenta threshold
+HUE_ORANGE_MAX = const(450)
+HUE_YELLOW_MAX = const(700)
+HUE_GREEN_MAX = const(1500)
+HUE_CYAN_MAX = const(2000)
+HUE_BLUE_MAX = const(2600)
+HUE_MAGENTA_MAX = const(3400)
+
 
 #viper not currently in use so we can return a tupple
 #@micropython.viper
 def _lookup_colour_math_viper(r: int, g: int, b: int, clear: int) -> tuple[int, int]:
     """Bare-metal Viper math processor for fast HSV mapping."""
-    h = 1200 # default hue for achromatic (gray) colours
+    h = 1200 # default hue for achromatic (gray) colours - meaningless but avoids having to cope with Null/None values in the calling code.
 
     # Inline max calculation to bypass standard Python max() function
     max_c = r
@@ -2056,32 +2120,32 @@ def _lookup_colour_math_viper(r: int, g: int, b: int, clear: int) -> tuple[int, 
             h = 6 * (((100 * (r - g)) // delta) + 400)
 
     # --- Achromatic branch (low saturation) ---
-    if s < 20:
+    if s < _ACHROMATIC_SATURATION_THRESHOLD:
         brightness_ref = clear if clear > 0 else max_c
         reflectance = 0
         if brightness_ref > 0:
             reflectance = (100 * max_c) // brightness_ref
 
-        if reflectance < 15:
+        if reflectance < _ACHROMATIC_REFLECTANCE_LOW_THRESHOLD:
             return ID_BLACK, 0
-        if reflectance > 65:
+        if reflectance > _ACHROMATIC_REFLECTANCE_HIGH_THRESHOLD:
             return ID_WHITE, 0
         return ID_GRAY, 0
 
     # --- Chromatic branch: compute hue (0 – 3600) ---
 
     # Hue classification
-    if h < 200 or h >= 3400:
+    if h < HUE_RED_MAX or h >= HUE_MAGENTA_MAX:
         return ID_RED, h
-    if h < 450:
+    if h < HUE_ORANGE_MAX:
         return ID_ORANGE, h
-    if h < 700:
+    if h < HUE_YELLOW_MAX:
         return ID_YELLOW, h
-    if h < 1500:
+    if h < HUE_GREEN_MAX:
         return ID_GREEN, h
-    if h < 2000:
+    if h < HUE_CYAN_MAX:
         return ID_CYAN, h
-    if h < 2600:
+    if h < HUE_BLUE_MAX:
         return ID_BLUE, h
     return ID_MAGENTA, h
 
@@ -2327,10 +2391,12 @@ class OPT4060(SensorBase):
         self._set_mode(_MODE_POWERDOWN)
         return True
 
+
     @micropython.native
     def _read_read_u16_be(self, reg: int) -> int:
         self._i2c.readfrom_mem_into(self._i2c_addr, reg, self._i2c_read_buffer_2)
         return (self._i2c_read_buffer_2[0] << 8) | self._i2c_read_buffer_2[1]
+
 
     @micropython.native
     def _read(self) -> tuple[int, int, int, int] | None:
