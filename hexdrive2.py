@@ -987,7 +987,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 self._colour_int.irq(Pin.IRQ_FALLING, handler=self._handle_colour_interrupt)
             sensor.start(self._colour_period_ms)
             if self._logging:
-                print(f"D:{self.config.port}:Colour Sensor Started")
+                print(f"D:{self.config.port}:Colour Sensor Started @{self._colour_period_ms}ms")
         else:
             if self._colour_interrupt_enabled:
                 self._colour_int.irq(Pin.IRQ_FALLING, handler=None)   # detach the interrupt handler first
