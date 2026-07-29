@@ -215,6 +215,9 @@ class HexDiagnostics():
                 self._diag_config = HexpansionConfig(hexdiag_port)
                 for i in range(4):
                     self._diag_config.pin[i].init(mode=Pin.OUT)
+        else:
+            hexdiag_port = None
+            self._diag_config = None
 
     @micropython.native
     def output(self, index: int, value: int):
@@ -2086,8 +2089,12 @@ HUE_MAGENTA_MAX = const(3400)
 
 #viper not currently in use so we can return a tupple
 #@micropython.viper
-def _lookup_colour_math_viper(r: int, g: int, b: int, clear: int) -> tuple[int, int]:
-    """Bare-metal Viper math processor for fast HSV mapping."""
+def _lookup_colour_math_viper(r: int, g: int, b: int, clear: int) -> tuple[int, int, int]:
+    """Bare-metal Viper math processor for fast HSV mapping.
+       Returns a tuple of (colour_id, hue, saturation) where colour_id is an integer ID for the colour
+        and hue is the hue value in the range 0-3600,
+        and saturation is the saturation value in the range 0-100.
+    """
     h = 1200 # default hue for achromatic (gray) colours - meaningless but avoids having to cope with Null/None values in the calling code.
 
     # Inline max calculation to bypass standard Python max() function
@@ -2096,7 +2103,7 @@ def _lookup_colour_math_viper(r: int, g: int, b: int, clear: int) -> tuple[int, 
     if b > max_c: max_c = b
 
     if max_c == 0:
-        return ID_BLACK, h
+        return ID_BLACK, h, 0
 
     # Inline min calculation to bypass standard Python min() function
     min_c = r
@@ -2127,27 +2134,28 @@ def _lookup_colour_math_viper(r: int, g: int, b: int, clear: int) -> tuple[int, 
             reflectance = (100 * max_c) // brightness_ref
 
         if reflectance < _ACHROMATIC_REFLECTANCE_LOW_THRESHOLD:
-            return ID_BLACK, 0
+            return ID_BLACK, 0, s
         if reflectance > _ACHROMATIC_REFLECTANCE_HIGH_THRESHOLD:
-            return ID_WHITE, 0
-        return ID_GRAY, 0
+            return ID_WHITE, 0, s
+        return ID_GRAY, 0, s
 
     # --- Chromatic branch: compute hue (0 – 3600) ---
 
     # Hue classification
     if h < HUE_RED_MAX or h >= HUE_MAGENTA_MAX:
-        return ID_RED, h
+        return ID_RED, h, s
     if h < HUE_ORANGE_MAX:
-        return ID_ORANGE, h
+        return ID_ORANGE, h, s
     if h < HUE_YELLOW_MAX:
-        return ID_YELLOW, h
+        return ID_YELLOW, h, s
     if h < HUE_GREEN_MAX:
-        return ID_GREEN, h
+        return ID_GREEN, h, s
     if h < HUE_CYAN_MAX:
-        return ID_CYAN, h
+        return ID_CYAN, h, s
     if h < HUE_BLUE_MAX:
-        return ID_BLUE, h
-    return ID_MAGENTA, h
+        return ID_BLUE, h, s
+    return ID_MAGENTA, h, s
+
 
 class ColourLookup:
     """Static class for mapping RGBW tuples to colour names via Viper math."""
@@ -2167,16 +2175,16 @@ class ColourLookup:
     )
 
     @staticmethod
-    def rgbw_to_str(colour: tuple[int, int, int, int]) -> tuple[str, int]:
+    def rgbw_to_str(colour: tuple[int, int, int, int]) -> tuple[str, int, int]:
         """User-facing entry point that bridges tuples to native Viper math."""
         # Unpack the tuple cleanly into 4 distinct integers
         r, g, b, clear = colour
 
         # Fire the hardware-accelerated Viper calculation engine
-        colour_id, hue = _lookup_colour_math_viper(r, g, b, clear)
+        colour_id, hue, saturation = _lookup_colour_math_viper(r, g, b, clear)
 
         # Instantly resolve the ID code back to an interned string token
-        return ColourLookup._COLOUR_TABLE[colour_id], hue
+        return ColourLookup._COLOUR_TABLE[colour_id], hue, saturation
 
 
 class OPT4060(SensorBase):
@@ -2187,7 +2195,7 @@ class OPT4060(SensorBase):
       "blue"  — Blue channel
       "w"     — Clear / White channel
     """
-    __slots__ = ("_overload", "_last_colour", "_last_colour_hue", "_calibrated", "_black_reference", "_white_reference", "_white_gains", "_i2c_buffer_16", "_i2c_read_buffer_2", "_conversion_time", "_interrupts")
+    __slots__ = ("_overload", "_last_colour", "_last_colour_hue", "_last_colour_saturation", "_calibrated", "_black_reference", "_white_reference", "_white_gains", "_i2c_buffer_16", "_i2c_read_buffer_2", "_conversion_time", "_interrupts")
 
 
     I2C_ADDR = _COLOUR_I2C_ADDRESS
@@ -2201,6 +2209,7 @@ class OPT4060(SensorBase):
         self._overload: bool = False                    # True if the last reading was saturated/overflowed
         self._last_colour: tuple[int, int, int, int] | None = None  # Last RGBC reading
         self._last_colour_hue: int = 0                  # Last colour hue (0-3600)
+        self._last_colour_saturation: int = 0           # Last colour saturation (0-100)
         self._calibrated: bool = False
         self._black_reference: tuple[int, int, int, int] | None = None  # Black reference RGBC values
         self._white_reference: tuple[int, int, int, int] | None = None  # White reference RGBC values
@@ -2229,8 +2238,9 @@ class OPT4060(SensorBase):
         if self._last_colour is None:
             return None
         calibrated_colour = self.apply_white_reference(self._last_colour)
-        colour_name, hue = ColourLookup.rgbw_to_str(calibrated_colour)
+        colour_name, hue, saturation = ColourLookup.rgbw_to_str(calibrated_colour)
         self._last_colour_hue = hue  # Store the hue for potential future use
+        self._last_colour_saturation = saturation  # Store the saturation for potential future use
         return colour_name
 
 
@@ -2239,6 +2249,11 @@ class OPT4060(SensorBase):
     def colour_hue(self) -> int | None:
         """Return the last colour hue (0-3600)"""
         return self._last_colour_hue
+
+    @property
+    def colour_saturation(self) -> int | None:
+        """Return the last colour saturation (0-100)"""
+        return self._last_colour_saturation
 
 
     @property
