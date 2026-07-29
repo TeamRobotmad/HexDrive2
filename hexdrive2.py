@@ -5,7 +5,7 @@
 # It is then run from the EEPROM by the BadgeOS.
 
 import time
-
+import asyncio
 try:
     from micropython import const
 except ImportError:
@@ -39,7 +39,6 @@ _ALT_RANGE_INT_PIN = const(4)   # Some models of the VL52L0X sensor module have 
 _ALT_RANGE_XSHUT_PIN = const(3) # Some models of the VL52L0X sensor module have the interrupt and XSHUT pins swapped
 
 _RANGE_SENSOR_XSHUT_RESPONSE_TIME_MS = const(20)  # Time to wait after changing the XSHUT pin state before the sensor is ready to respond to I2C commands
-#_SENSOR_CHECK_INTERVAL_MS = const(100)  # Interval to check for new sensor readings in continuous mode (ms) - as a fallback in case the interrupts are missed
 
 # Hexpansion EEPROM constants
 _ADDR_LEN = const(2)          # EEPROM I2C address length in bytes (1 or 2)
@@ -243,7 +242,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         "_colour_int", "_range_xshut", "_range_int", "_servo_pin_map",
         "_servo_centre", "_cached_range_event", "_cached_colour_event",
         "_range_events_enabled", "_range_interrupt_enabled",
-        "_colour_events_enabled", "_colour_interrupt_enabled") # ,"background_update_period",)
+        "_colour_events_enabled", "_colour_interrupt_enabled","_background_update_period",)
 
     VERSION = 3         # Increment this when making changes to the app that require the hexpansion EEPROM app to be re-flashed with the new code.
 
@@ -354,7 +353,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             self._range_xshut:   ePin = self.config.ls_pin[_ALT_RANGE_XSHUT_PIN if self._extended_header.flags & _EXTENDED_HEADER_FLAG_RANGE_PINS_SWAPPED else _RANGE_XSHUT_PIN]
             self._range_int:     ePin = self.config.ls_pin[_ALT_RANGE_INT_PIN if self._extended_header.flags & _EXTENDED_HEADER_FLAG_RANGE_PINS_SWAPPED else _RANGE_INT_PIN]
 
-        #self.background_update_period: int = _SENSOR_CHECK_INTERVAL_MS
+        self._background_update_period: int = const(50)
 
         # Servo related
         if self._hexdrive_type.servos > 0:
@@ -463,18 +462,18 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 
     # For unknown reason using this task completely breaks the colour sensor - the background_update is never called, but if magically
     # restarts when the colour sensor is disabled. So for now we just call background_update() from the main loop of the BadgeOS instead of using a background task.
-    #@micropython.native
-    #async def background_task(self):
-    #    """Background task loop for handling time-based updates. This runs independently of the main update/draw loop
-    #       and is suitable for tasks that need to run at a consistent interval regardless of the current state or drawing performance."""
-    #    last_time = time.ticks_ms()
+    @micropython.native
+    async def background_task(self):
+        """Background task loop for handling time-based updates. This runs independently of the main update/draw loop
+           and is suitable for tasks that need to run at a consistent interval regardless of the current state or drawing performance."""
+        last_time = time.ticks_ms()
 
-    #    while True:
-    #        cur_time = time.ticks_ms()
-    #        delta_ticks = time.ticks_diff(cur_time, last_time)
-    #        self.background_update(delta_ticks)
-    #        await asyncio.sleep_ms(max (1, self.background_update_period - (time.ticks_ms() - cur_time)))  # sleep for the remainder of the update period, accounting for time taken by background_update
-    #        last_time = cur_time
+        while True:
+            cur_time = time.ticks_ms()
+            delta_ticks = time.ticks_diff(cur_time, last_time)
+            self.background_update(delta_ticks)
+            await asyncio.sleep_ms(max (1, self._background_update_period - (time.ticks_ms() - cur_time)))  # sleep for the remainder of the update period, accounting for time taken by background_update
+            last_time = cur_time
 
 
     @micropython.native
@@ -491,7 +490,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             range_sensor = self.range_sensor
             if range_sensor is not None and range_sensor.is_continuous:
                 self._hexdiag.output(3, 1)
-                self._hexdiag.output(0, 1)
+                self._hexdiag.output(2, 1)
                 diag_output = True
                 # Checking the state of the range sensor interrupt pin takes I2C communication with the AW9523 chip,
                 # so we may aswell assume it is active and use the I2C time to read the status register of the sensor instead.
@@ -499,6 +498,8 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 if measurement is not None and self._range_events_enabled:
                     self._cached_range_event.range = measurement
                     eventbus.emit(self._cached_range_event)
+                self._hexdiag.output(2, 0)
+
         # Currently never using interrupts for the colour sensor as it is not reliable on some modules, so we just poll it in the background update loop
         #if not self._colour_interrupt_enabled:
         # Colour Sensor
@@ -506,8 +507,8 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         if colour_sensor is not None and colour_sensor.is_continuous:
             if not diag_output:
                 self._hexdiag.output(3, 1)
-                self._hexdiag.output(0, 1)
                 diag_output = True
+            self._hexdiag.output(1, 1)
             # Checking the state of the colour sensor interrupt pin takes I2C communication with the AW9523 chip,
             # so we may aswell assume it is active and use the I2C time to read the status register of the sensor instead.
             measurement = colour_sensor.read()
@@ -515,6 +516,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 # we read the colour from the sensor class rather than using the return from read() to keep the linter quiet
                 self._cached_colour_event.colour = measurement
                 eventbus.emit(self._cached_colour_event)
+            self._hexdiag.output(1, 0)
 
         # Keep Alive
         if self._pwm_setup and self._outputs_energised:
@@ -539,7 +541,21 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 
         if diag_output:
             self._hexdiag.output(3, 0)
-            self._hexdiag.output(0, 0)
+
+
+    def set_background_update_period(self, period_ms: int | None = None) -> None:
+        """ Set the period of the background update task in milliseconds. """
+        # based on the minimum of the range and colour sensor periods, but can be overridden by the user if they want to change it.
+        if period_ms is not None and period_ms > 0:
+            self._background_update_period = period_ms
+        else:
+            self._background_update_period = const(50)
+            if self.colour_sensor is not None and self.colour_sensor.is_continuous and not self._colour_interrupt_enabled:
+                self._background_update_period = min(self._background_update_period, self._colour_period_ms)
+            if self.range_sensor is not None and self.range_sensor.is_continuous and not self._range_interrupt_enabled:
+                self._background_update_period = min(self._background_update_period, self._range_period_ms)
+        if self._logging:
+            print(f"D:{self.config.port}:Background update period set to {self._background_update_period}ms")
 
 
     def get_status(self) -> bool:
@@ -914,6 +930,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 self.range_sensor = None
                 self._range_events_enabled = False
             self.set_range_xshut(False)         # power the sensor down (holds it in hardware reset)
+        self.set_background_update_period()
 
 
     @property
@@ -1003,6 +1020,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                     print(f"D:{self.config.port}:Colour Sensor Stopped")
                 self.colour_sensor = None
                 self._colour_events_enabled = False
+        self.set_background_update_period()
 
 
     def set_colour_period(self, period_ms: int) -> None:
@@ -1273,7 +1291,8 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             _pin: the LS pin object that fired (supplied by the scheduler, unused - the bound 'self'
                 already identifies the sensor).
         """
-        self._hexdiag.output(3, 1)
+        #self._hexdiag.output(3, 1)
+        self._hexdiag.output(2, 1)
 
         # Check the actual state of the interrupt pin to avoid spurious rising-edge callbacks (see `range_enable`).
         # Actually as reading the state of the _range_int pin takes I2C communication with the AW9523B expander,
@@ -1283,8 +1302,8 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         if measurement is not None and self._range_events_enabled:
             self._cached_range_event.range = measurement
             eventbus.emit(self._cached_range_event)
-
-        self._hexdiag.output(3, 0)
+        #self._hexdiag.output(3, 1)
+        self._hexdiag.output(2, 0)
 
 
 #---------------------------------------------------------------------------------
@@ -1305,7 +1324,8 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 already identifies the sensor).
         """
 
-        self._hexdiag.output(3, 1)
+        #self._hexdiag.output(3, 1)
+        self._hexdiag.output(1, 1)
 
         # Check the actual state of the interrupt pin to avoid spurious rising-edge callbacks (see `colour_enable`).
         # Actually as reading the state of the _colour_int pin takes I2C communication with the AW9523B expander,
@@ -1317,7 +1337,8 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             self._cached_colour_event.colour = measurement
             eventbus.emit(self._cached_colour_event)
 
-        self._hexdiag.output(3, 0)
+        #self._hexdiag.output(3, 0)
+        self._hexdiag.output(1, 0)
 
 
 """
