@@ -422,7 +422,8 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         for _channel, _pwm in enumerate(self.pwm_outputs):
             if _pwm is not None and self._pwm_init[_channel]:
                 try:
-                    print(self._pwm_log_string(_channel) + "deinit")
+                    if self._logging:
+                        print(self._pwm_log_string(_channel) + "deinit")
                     _pwm.deinit()
                     self._pwm_init[_channel] = False
                 except Exception:       # pylint: disable=broad-except
