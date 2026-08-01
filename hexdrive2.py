@@ -632,14 +632,13 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                             print(self._pwm_log_string(this_channel) + f"pin{this_channel}=Off")
                 else:
                     try:
-                        if self._freq[this_channel]:
-                            if not self._pwm_init[this_channel]:
-                                pwm.init(freq=freq)
-                                self._pwm_init[this_channel] = True
-                                if self._logging:
-                                    print(self._pwm_log_string(this_channel) + "init")
-                            else:
-                                pwm.freq(freq)
+                        if not self._pwm_init[this_channel]:
+                            pwm.init(freq=freq)
+                            self._pwm_init[this_channel] = True
+                            if self._logging:
+                                print(self._pwm_log_string(this_channel) + "init")
+                        else:
+                            pwm.freq(freq)
                         if self._logging:
                             print(self._pwm_log_string(this_channel) + f"{freq}Hz set")
                     except Exception as e:  # pylint: disable=broad-except
