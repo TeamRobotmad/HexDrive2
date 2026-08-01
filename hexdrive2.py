@@ -780,7 +780,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             try:
                 # if the output is changing direction then we need to switch which signal is being driven as the PWM output
                 # rather than test for change of direction and also test that pwm_outputs to be disabled exists we just do the latter check.
-                # if the output is actaully going to be 0 then it doesn't matter which output is enabled or disabled as both will be set to 0 anyway.
+                # if the output is actually going to be 0 then it doesn't matter which output is enabled or disabled as both will be set to 0 anyway.
                 output_to_enable  = 3- ((motor<<1)   if output > 0 else ((motor<<1)+1))
                 output_to_disable = 3- ((motor<<1)+1 if output > 0 else (motor<<1))
                 if 0 != output:
