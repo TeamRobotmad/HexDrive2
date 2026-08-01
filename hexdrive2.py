@@ -993,6 +993,16 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         raise RuntimeError(f"D:{self.config.port}:Colour Sensor period set failed")
 
 
+    @property
+    def colour(self) -> tuple[int, int, int, int] | None:
+        """Return the most recent colour measurement.
+
+        Returns None until the first reading has been received. New readings arrive automatically
+        (via `ColourEvent`) while continuous colour sensing is enabled with `colour_enable`.
+        """
+        return self.colour_sensor.colour
+
+
 #----------------------------------------------------------------
 # PRIVATE ASYNC methods
 #----------------------------------------------------------------
