@@ -587,17 +587,6 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         self._keep_alive_period = period
 
 
-    @micropython.viper
-    def _pin_index_from_logical_channel(self, channel: int) -> int:
-        """ Map from logical channel to physical channel(s) for motors. """
-        index: int = (channel << 1)
-        output: int = int(self._motor_output[channel])
-        if output > 0:
-            index += 1
-        index = 3 - index        # 3 - to reverse pin order to match Hexpansion hardware
-        return index
-
-
     def set_freq(self, freq: int, channel: int | None = None, servo: bool | None = None) -> bool:
         """ Set the PWM frequency for a specific output, or all outputs if channel is None. Returns True if successful, False if failed.
             Use 50 to 200 for Servos and 5000 to 20000 for motors.
@@ -1091,7 +1080,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         if duty_cycle < 0 or duty_cycle > 65535:
             return False
         try:
-            physical_pin_index = self._pin_index_from_logical_channel(channel)
+            physical_pin_index = 3 - channel    # The physical pin index is the reverse of the channel number (0-3) for the 4 PWM outputs on the HexDrive2
             pwm = self.pwm_outputs[channel]
             if pwm is None:
                 # Channel hasn't been setup yet so we need to initialise it from scratch
