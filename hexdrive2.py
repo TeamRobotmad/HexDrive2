@@ -69,6 +69,7 @@ _MAX_NUM_CHANNELS = const(4)               # Max number of PWM channels supporte
 _MAX_NUM_MOTORS = const(2)                 # Max number of motor channels supported by any type of HexDrive
 
 # Servo Constants
+_MIN_SERVO_FREQ = const(10)                # 10Hz = 100mS period (minimum frequency for servos)
 _MAX_SERVO_FREQ = const(200)               # 200Hz = 5mS period (can work with some Servos but not all)
 _SERVO_CENTRE    = const(1500)             # 1500us pulse width is the centre position for most RC servos (but some may be different, so we allow this to be trimmed)
 _MAX_SERVO_RANGE = const(1400)             # 1400us either side of centre (VERY WIDE)
@@ -235,7 +236,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         "config", "_logging", "_i2c", "_i2c_buffer_32", "_hexdiag","_hexdrive_type",
         "_keep_alive_period", "_power_state", "_pwm_setup",
         "_time_since_last_update", "_outputs_energised",
-        "pwm_outputs", "_pwm_init","_freq", "_motor_output", "_extended_header",
+        "pwm_outputs", "_pwm_pin_index","_freq", "_motor_output", "_extended_header",
         "_time_since_last_sensor_check",
         "range_sensor", "_range_period_ms", "colour_sensor",
         "_colour_period_ms", "_power_control", "_led_control",
@@ -304,7 +305,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         self._time_since_last_update: int = 0
         self._outputs_energised: bool = False
         self.pwm_outputs: list[PWM | None] = [None] * _MAX_NUM_CHANNELS
-        self._pwm_init: list[bool] = [False] * _MAX_NUM_CHANNELS
+        self._pwm_pin_index: list[int] = [-1] * _MAX_NUM_CHANNELS                  # which physical pin is being used for each logical channel (or -1 if not in use)
         self._freq: list[int] = [0] * _MAX_NUM_CHANNELS
         if self._hexdrive_type.motors > 0:
             self._motor_output: list[int] = [0] * self._hexdrive_type.motors
@@ -420,12 +421,12 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
     def deinit(self):
         """ De-initialise all PWM outputs and free up resources. """
         for _channel, _pwm in enumerate(self.pwm_outputs):
-            if _pwm is not None and self._pwm_init[_channel]:
+            if _pwm is not None and self._pwm_pin_index[_channel] >= 0:
                 try:
                     if self._logging:
                         print(self._pwm_log_string(_channel) + "deinit")
                     _pwm.deinit()
-                    self._pwm_init[_channel] = False
+                    self._pwm_pin_index[_channel] = -1
                 except Exception:       # pylint: disable=broad-except
                     pass
         for _channel in range(_MAX_NUM_CHANNELS):
@@ -520,12 +521,12 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 for channel,pwm in enumerate(self.pwm_outputs):
                     if pwm is not None:
                         try:
-                            if self._pwm_init[channel]:
+                            if self._pwm_pin_index[channel] >= 0:
                                 pwm.duty_u16(0)
                         except Exception as e:          # pylint: disable=broad-except
                             print(self._pwm_log_string(channel) + f"Off failed {e}")
                             self.pwm_outputs[channel] = None  # Tidy Up
-                            self._pwm_init[channel] = False
+                            self._pwm_pin_index[channel] = -1
                             self._freq[channel] = 0
 
         if diag_output:
@@ -586,64 +587,80 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         self._keep_alive_period = period
 
 
-    def set_freq(self, freq: int, channel: int | None = None, servo: bool = False) -> bool:
+    @micropython.viper
+    def _pin_index_from_logical_channel(self, channel: int) -> int:
+        """ Map from logical channel to physical channel(s) for motors. """
+        index: int = (channel << 1)
+        output: int = int(self._motor_output[channel])
+        if output > 0:
+            index += 1
+        index = 3 - index        # 3 - to reverse pin order to match Hexpansion hardware
+        return index
+
+
+    def set_freq(self, freq: int, channel: int | None = None, servo: bool | None = None) -> bool:
         """ Set the PWM frequency for a specific output, or all outputs if channel is None. Returns True if successful, False if failed.
-            Use 50 to 200 for Servos and 5000 to 20000 for motors. """
+            Use 50 to 200 for Servos and 5000 to 20000 for motors.
+            servo: True = Servo, False = Motor, None = Auto-detect based on frequency. """
         if freq < 0 or freq > 100000:
             return False
-        physical_channel: int | None = None
+
+        # Auto-detect if this is a servo or motor based on the frequency if servo is None
+        if servo is None:
+            if freq < 200:
+                servo = True
+            else:
+                servo = False
+
         if channel is not None:
+            # set the frequency for a specific channel
             _max_channel = self._hexdrive_type.servos if servo else self._hexdrive_type.motors
             if channel < 0 or channel >= _max_channel:
                 return False
-            # map from logical channel to physical channel(s) for servos and motors
             if servo and self._hexdrive_type.servos > 0:
                 self._freq[channel] = freq
-                physical_channel = self._servo_pin_map[channel]
             elif self._hexdrive_type.motors > 0:
+                # set the frequency for both physical channels of the motor (A and B) to the same value
                 self._freq[channel << 1] = freq
                 self._freq[(channel << 1) + 1] = freq
-                physical_channel = 3- ((channel << 1) + (self._motor_output[channel] > 0)) # 3- to reverse pin order to match Hexpansion hardware
+            else:
+                return False
         else:
+            # set the frequency for all channels
             if servo:
                 for ch in range(self._hexdrive_type.servos):
                     self._freq[ch] = freq
             else:
                 for ch in range(self._hexdrive_type.motors):
+                    # set the frequency for both physical channels of the motor (A and B) to the same value
                     self._freq[ch<<1] = freq
                     self._freq[(ch<<1)+1] = freq
-            physical_channel = None # All channels
 
         # Action new frequency immediately for any channels that are already setup
         for this_channel, pwm in enumerate(self.pwm_outputs):
-            if (physical_channel is None or (this_channel == physical_channel)) and pwm is not None:
+            if (channel is None or (this_channel == channel)) and pwm is not None:
                 if freq == 0:
-                    if self._freq[this_channel] != 0:
-                        # If frequency is set to 0 then we deinit the PWM to free up resources as much as possible
-                        if self._pwm_init[this_channel]:
-                            pwm.deinit()
-                            self._pwm_init[this_channel] = False
-                            if self._logging:
-                                print(self._pwm_log_string(this_channel) + "deinit")
-                        self._freq[this_channel] = 0
-                        self.config.pin[this_channel].init(mode=Pin.OUT)
-                        self.config.pin[this_channel].value(0)
+                    # If frequency is being set to 0 then we deinit the PWM to free up resources as much as possible
+                    # but we do not destroy the PWM object as it may be re-used later if the frequency is set to a non-zero value again.
+                    physical_pin_index = self._pwm_pin_index[this_channel]
+                    if physical_pin_index >= 0:
+                        pwm.deinit()
                         if self._logging:
-                            print(self._pwm_log_string(this_channel) + f"pin{this_channel}=Off")
+                            print(self._pwm_log_string(this_channel) + "deinit")
+                        # now that the PWM has been deinitialised we need to control the pin - set low
+                        self.config.pin[physical_pin_index].init(mode=Pin.OUT)
+                        self.config.pin[physical_pin_index].value(0)
+                        if self._logging:
+                            print(self._pwm_log_string(this_channel) + f"pin{physical_pin_index}=Off")
+                        self._pwm_pin_index[this_channel] = -1
                 else:
                     try:
-                        if self._freq[this_channel]:
-                            if not self._pwm_init[this_channel]:
-                                pwm.init(freq=freq)
-                                self._pwm_init[this_channel] = True
-                                if self._logging:
-                                    print(self._pwm_log_string(this_channel) + "init")
-                            else:
-                                pwm.freq(freq)
-                        if self._logging:
-                            print(self._pwm_log_string(this_channel) + f"{freq}Hz set")
+                        if self._pwm_pin_index[this_channel] >= 0:
+                            pwm.freq(freq)
+                            if self._logging:
+                                print(self._pwm_log_string(this_channel) + f"{freq}Hz")
                     except Exception as e:  # pylint: disable=broad-except
-                        print(self._pwm_log_string(this_channel) + f"set freq {freq} failed {e}")
+                        print(self._pwm_log_string(this_channel) + f"set freq {freq}Hz failed {e}")
                         return False
         return True
 
@@ -662,82 +679,78 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             if channel is None:
                 # channel == None -> Turn off all PWM outputs
                 for ch, pwm in enumerate(self.pwm_outputs):
-                    if pwm is not None and ch in self._servo_pin_map and self._pwm_init[ch]:
+                    if pwm is not None and ch in self._servo_pin_map and 0 < pwm.freq():
                         try:
                             pwm.duty_ns(0)
                         except Exception as e:  # pylint: disable=broad-except
-                            print(self._pwm_log_string(ch) + f"Off failed {e}")
+                            print(self._pwm_log_string(ch) + f"0 duty failed {e}")
                 if self._logging:
-                    print(self._pwm_log_string(None) + "Off")
+                    print(self._pwm_log_string(None) + "0 duty all")
                 self._outputs_energised = False
                 return True
             elif channel < 0 or channel >= self._hexdrive_type.servos:
                 return False
             else:
-                physical_channel = self._servo_pin_map[channel]
-                pwm = self.pwm_outputs[physical_channel]
-                if pwm is None or self._pwm_init[physical_channel] is False:
-                    return False
+                pwm = self.pwm_outputs[channel]
+                if pwm is None or self._pwm_pin_index[channel] < 0:
+                    return True # already off
                 try:
                     pwm.duty_ns(0)
                     if self._logging:
-                        print(self._pwm_log_string(physical_channel) + "Off")
+                        print(self._pwm_log_string(channel) + "0 duty")
                 except Exception as e:          # pylint: disable=broad-except
-                    print(self._pwm_log_string(physical_channel) + f"Off failed {e}")
+                    print(self._pwm_log_string(channel) + f"0 duty failed {e}")
                     return False
-            # check if all channels are now off and set outputs_energised accordingly
-            #self._check_outputs_energised()
         elif channel is not None:
             if channel < 0 or channel >= self._hexdrive_type.servos:
                 return False
             if abs(position) > _MAX_SERVO_RANGE:
                 return False
-            physical_channel = self._servo_pin_map[channel]
+            if self._freq[channel] > _MAX_SERVO_FREQ or self._freq[channel] < _MIN_SERVO_FREQ:
+                # force the frequency to be suitable for use with Servos otherwise the pulse width will not be accepted
+                self._freq[channel] = _DEFAULT_SERVO_FREQ
+            physical_pin_index = self._servo_pin_map[channel]
             pulse_width_in_ns = (self._servo_centre[channel] + position) * 1000 # convert from us to ns
-            if self.pwm_outputs[physical_channel] is None:
+            pwm = self.pwm_outputs[channel]
+            if pwm is None:
                 # Channel hasn't been setup yet so we need to initialise it from scratch
-                self._freq[channel] = self._freq[channel] if (0 < self._freq[channel]) and (self._freq[channel] <= _MAX_SERVO_FREQ) else _DEFAULT_SERVO_FREQ
                 try:
                     # Micropython v1.28 generates a spurious warning when we try to initialise a PWM on a pin that was previously used.
                     # "W (557771) ledc: GPIO 47 is not usable, maybe conflict with others"
-                    pin = self.config.pin[physical_channel]
+                    pin = self.config.pin[physical_pin_index]
                     pwm = PWM(pin, freq = self._freq[channel])
                     pwm.duty_ns(pulse_width_in_ns)
-                    self.pwm_outputs[physical_channel] = pwm
-                    self._pwm_init[physical_channel] = True
+                    self.pwm_outputs[channel] = pwm
+                    self._pwm_pin_index[channel] = physical_pin_index
                     if self._logging:
-                        print(self._pwm_log_string(physical_channel) + f"{self.pwm_outputs[physical_channel]} created")
+                        print(self._pwm_log_string(channel) + f"{self.pwm_outputs[channel]} created")
                 except Exception as e:      # pylint: disable=broad-except
                     # There are a finite number of PWM resources so it is possible that we run out
-                    print(self._pwm_log_string(physical_channel) + f"PWM(init) failed {e}")
+                    print(self._pwm_log_string(channel) + f"PWM(init) failed {e}")
                     return False
             else:
                 # Channel is already setup so we just need to change the duty cycle and possibly the frequency if it is too high for the servo
-                pwm = self.pwm_outputs[physical_channel]
-                if pwm is None:
-                    return False
                 try:
-                    if not self._pwm_init[physical_channel]:
+                    if self._pwm_pin_index[channel] < 0:
+                        # pwm needs to be re-initialised
                         pwm.init(freq=self._freq[channel])
-                        self._pwm_init[physical_channel] = True
+                        self._pwm_pin_index[channel] = physical_pin_index
                         if self._logging:
-                            print(self._pwm_log_string(physical_channel) + f"{self.pwm_outputs[physical_channel]} init")
-                    if _MAX_SERVO_FREQ < pwm.freq():
-                        # Ensure the frequency is suitable for use with Servos
-                        # otherwise the pulse width will not be accepted
-                        self._freq[channel] = _DEFAULT_SERVO_FREQ
-                        pwm.freq(_DEFAULT_SERVO_FREQ)
+                            print(self._pwm_log_string(channel) + f"{self.pwm_outputs[channel]} init")
+                    elif self._freq[channel] != pwm.freq():
+                        # although pwm is already initialised, the frequency has changed so we need to update it
+                        pwm.freq(self._freq[channel])
                         if self._logging:
-                            print(self._pwm_log_string(physical_channel) + f"{_DEFAULT_SERVO_FREQ}Hz for Servo")
+                            print(self._pwm_log_string(channel) + f"{self._freq[channel]}Hz for Servo")
                 except Exception as e:          # pylint: disable=broad-except
-                    print(self._pwm_log_string(physical_channel) + f"set freq failed {e}")
+                    print(self._pwm_log_string(channel) + f"set freq failed {e}")
                     return False
                 # Scale servo position to PWM duty cycle (500-2500us)
                 try:
                     if 2000 < abs(pulse_width_in_ns - pwm.duty_ns()):    # allow tolerance of 2us to avoid unnecessary updates
                         pwm.duty_ns(pulse_width_in_ns)
                 except Exception as e:          # pylint: disable=broad-except
-                    print(self._pwm_log_string(physical_channel) + f"set duty failed {e}")
+                    print(self._pwm_log_string(channel) + f"set duty failed {e}")
                     return False
 
             self._outputs_energised = True
@@ -781,32 +794,33 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 # if the output is changing direction then we need to switch which signal is being driven as the PWM output
                 # rather than test for change of direction and also test that pwm_outputs to be disabled exists we just do the latter check.
                 # if the output is actaully going to be 0 then it doesn't matter which output is enabled or disabled as both will be set to 0 anyway.
-                output_to_enable  = 3- ((motor<<1)   if output > 0 else ((motor<<1)+1))
-                output_to_disable = 3- ((motor<<1)+1 if output > 0 else (motor<<1))
+                channel_to_enable  = (motor<<1)   if output > 0 else ((motor<<1)+1)
+                channel_to_disable = (motor<<1)+1 if output > 0 else (motor<<1)
+                pin_to_disable = self._pwm_pin_index[channel_to_disable]
                 if 0 != output:
                     # if the new output is not 0 then we need to switch the active output to the new one
                     # switch off the currently active output before switching the other one on to prevent both outputs being on at the same time
-                    pwm_to_disable = self.pwm_outputs[output_to_disable]
-                    if pwm_to_disable is not None and self._pwm_init[output_to_disable]:
+                    pwm_to_disable = self.pwm_outputs[channel_to_disable]
+                    if pwm_to_disable is not None and pin_to_disable >= 0:
                         pwm_to_disable.deinit()
-                        self._pwm_init[output_to_disable] = False
-                        self.config.pin[output_to_disable].init(mode=Pin.OUT)
-                        self.config.pin[output_to_disable].value(0)
+                        self.config.pin[pin_to_disable].init(mode=Pin.OUT)
+                        self.config.pin[pin_to_disable].value(0)
+                        self._pwm_pin_index[channel_to_disable] = -1
                         if self._logging:
-                            print(self._pwm_log_string(output_to_disable) + " deinit")
-                            print(f"D:{self.config.port}:pin{output_to_disable}=Off")
+                            print(self._pwm_log_string(channel_to_disable) + " deinit")
+                            print(f"D:{self.config.port}:pin{pin_to_disable}=Off")
                 else:
                     # if the new output is 0 then we can just switch off the currently active output and leave the other one off for now.
-                    pwm_to_switch_off = self.pwm_outputs[output_to_disable]
-                    if pwm_to_switch_off is not None and self._pwm_init[output_to_disable]:
+                    pwm_to_switch_off = self.pwm_outputs[channel_to_disable]
+                    if pwm_to_switch_off is not None and pin_to_disable >= 0:
                         pwm_to_switch_off.duty_u16(0)
                         if self._logging:
-                            print(f"D:{self.config.port}:pin{output_to_disable}=0 duty")
+                            print(f"D:{self.config.port}:pin{pin_to_disable}=0 duty")
 
-                if 0 != output or self._pwm_init[output_to_enable]:
-                    # if output_to_enable is NOT already active and new output is 0 then we can leave it off for now.
+                if 0 != output or self._pwm_pin_index[channel_to_enable] >= 0:
+                    # if channel_to_enable is NOT already active and new output is 0 then we can leave it off for now.
                     # otherwise we need to set the new output value
-                    self._set_pwmoutput(output_to_enable, abs(output))
+                    self._set_pwmoutput(channel_to_enable, abs(output))
             except Exception as e:          # pylint: disable=broad-except
                 print(f"D:{self.config.port}:Motor{motor}:{output} set failed {e}")
                 return False
@@ -1073,38 +1087,37 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 
     # Set a single PWM duty cycle (0-65535) for a specific MOTOR output
     # if the channel has not been setup yet then we initialise it from scratch, otherwise we just change the duty cycle
-    def _set_pwmoutput(self, _channel: int, _duty_cycle: int) -> bool:
-        if _duty_cycle < 0 or _duty_cycle > 65535:
+    def _set_pwmoutput(self, channel: int, duty_cycle: int) -> bool:
+        if duty_cycle < 0 or duty_cycle > 65535:
             return False
         try:
-            if self.pwm_outputs[_channel] is None:
+            physical_pin_index = self._pin_index_from_logical_channel(channel)
+            pwm = self.pwm_outputs[channel]
+            if pwm is None:
                 # Channel hasn't been setup yet so we need to initialise it from scratch
-                pin = self.config.pin[_channel]
+                pin = self.config.pin[physical_pin_index]
                 # Micropython v1.28 generates a spurious warning when we try to initialise a PWM on a pin that was previously used.
                 # "W (557771) ledc: GPIO 47 is not usable, maybe conflict with others"
-                pwm = PWM(pin, freq = self._freq[_channel])
-                pwm.duty_u16(_duty_cycle)
-                self.pwm_outputs[_channel] = pwm
-                self._pwm_init[_channel] = True
+                pwm = PWM(pin, freq = self._freq[channel])
+                pwm.duty_u16(duty_cycle)
+                self.pwm_outputs[channel] = pwm
+                self._pwm_pin_index[channel] = physical_pin_index
                 if self._logging:
-                    print(self._pwm_log_string(_channel) + f"{self.pwm_outputs[_channel]} created")
-            pwm = self.pwm_outputs[_channel]
-            if pwm is None:
-                print(self._pwm_log_string(_channel) + f"pwm_outputs[{_channel}] is None!!!")
-                return False
-            if self._pwm_init[_channel] is False:
-                pwm.init(freq=self._freq[_channel])
-                self._pwm_init[_channel] = True
+                    print(self._pwm_log_string(channel) + f"{self.pwm_outputs[channel]} created")
+                return True
+            if self._pwm_pin_index[channel] < 0:
+                pwm.init(freq=self._freq[channel])
+                self._pwm_pin_index[channel] = physical_pin_index
                 if self._logging:
-                    print(self._pwm_log_string(_channel) + f"{self.pwm_outputs[_channel]} init")
-            if _duty_cycle != pwm.duty_u16():
-                pwm.duty_u16(_duty_cycle)
+                    print(self._pwm_log_string(channel) + f"{self.pwm_outputs[channel]} init")
+            if duty_cycle != pwm.duty_u16():
+                pwm.duty_u16(duty_cycle)
                 if self._logging:
-                    print(self._pwm_log_string(_channel) + f"{_duty_cycle}")
+                    print(self._pwm_log_string(channel) + f"{duty_cycle}")
             else:
-                print(self._pwm_log_string(_channel) + f"{_duty_cycle} (no change)")
+                print(self._pwm_log_string(channel) + f"{duty_cycle} (no change)")
         except Exception as e:              # pylint: disable=broad-except
-            print(self._pwm_log_string(_channel) + f"set {_duty_cycle} failed {e}")
+            print(self._pwm_log_string(channel) + f"set {duty_cycle} failed {e}")
             return False
         return True
 
