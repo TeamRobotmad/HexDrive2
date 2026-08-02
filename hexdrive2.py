@@ -450,8 +450,8 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             self._colour_events_enabled = False
 
 
-    # For unknown reason using this task completely breaks the colour sensor - the background_update is never called, but if magically
-    # restarts when the colour sensor is disabled. So for now we just call background_update() from the main loop of the BadgeOS instead of using a background task.
+    # Run background_update() in an asyncio task so sensor polling / keep-alive runs at a steady interval.
+    # The update period is controlled by self._background_update_period (see set_background_update_period()).
     @micropython.native
     async def background_task(self):
         """Background task loop for handling time-based updates. This runs independently of the main update/draw loop
