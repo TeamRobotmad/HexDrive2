@@ -29,6 +29,16 @@ mpy-cross -march=xtensawin -O2 -v hexdrive2.py -o hexdrive2.mpy
 
 The resulting `hexdrive2.mpy` should then be copied into the consuming app's `EEPROM/` directory. When a host app writes that file to a hexpansion EEPROM it is renamed to `app.mpy` on the EEPROM so BadgeOS will discover it automatically.
 
+## Testing
+
+The compatibility tests use only the Python standard library:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+They load the app with and without a stub `i2c_mgr` module and cover cached manager reads, legacy direct I2C reads, readiness checks, and measurement sequence updates.
+
 ## Public API
 
 The current `HexDriveApp` implementation exposes these control methods:

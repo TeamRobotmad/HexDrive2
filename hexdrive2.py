@@ -25,6 +25,13 @@ import app
 from tildagon import Pin as ePin
 import micropython
 
+try:
+    import i2c_mgr
+except ImportError:
+    i2c_mgr = None
+
+_MIN_SENSOR_PERIOD_MS = i2c_mgr.MIN_PERIOD_MS if i2c_mgr is not None else const(10)
+
 # Define the minimum BadgeOS version required to run this app (e.g. if we need features that are only available in a certain version of BadgeOS)
 _MIN_BADGEOS_VERSION = [2, 2, 0]     # v2.2.0 is required to be able to use the new hexpansion utilites
 
@@ -63,8 +70,8 @@ _EXTENDED_HEADER_FLAG_INITIALISED         = const(0x8000)  # Flag indicating tha
 _DEFAULT_PWM_FREQ = const(20000)           # 20kHz is a good default for motors as it is above the audible range for most people and works with most motors and ESCs
 _DEFAULT_SERVO_FREQ = const(50)            # 50Hz = 20mS period
 _DEFAULT_KEEP_ALIVE_PERIOD = const(1000)   # 1 second
-_DEFAULT_RANGE_PERIOD_MS = const(100)      # default inter-measurement period (ms) for continuous distance ranging; 0 = back-to-back (as fast as the sensor allows)
-_DEFAULT_COLOUR_PERIOD_MS = const(100)     # default inter-measurement period (ms) for continuous colour readings ; 0 = back-to-back (as fast as the sensor allows)
+_DEFAULT_RANGE_PERIOD_MS = const(100)      # default inter-measurement period (ms) for continuous distance ranging
+_DEFAULT_COLOUR_PERIOD_MS = const(100)     # default inter-measurement period (ms) for continuous colour readings
 _MAX_NUM_CHANNELS = const(4)               # Max number of PWM channels supported by any type of HexDrive (Hexpansion limitation, not BadgeBot limit)
 _MAX_NUM_MOTORS = const(2)                 # Max number of motor channels supported by any type of HexDrive
 
@@ -245,7 +252,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         "_range_events_enabled", "_range_interrupt_enabled",
         "_colour_events_enabled", "_colour_interrupt_enabled","_background_update_period",)
 
-    VERSION = 3         # Increment this when making changes to the app that require the hexpansion EEPROM app to be re-flashed with the new code.
+    VERSION = 4         # Increment this when making changes to the app that require the hexpansion EEPROM app to be re-flashed with the new code.
 
 
     class RangeEvent(Event):
@@ -330,14 +337,14 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 
         self._range_events_enabled: bool = False
         self._range_interrupt_enabled: bool = False
-        self.range_sensor: VL53L0X = VL53L0X(self._i2c, logging=self._logging)
-        self._range_period_ms: int = _DEFAULT_RANGE_PERIOD_MS  # inter-measurement period for continuous ranging (0 = back-to-back / as fast as the sensor allows)
+        self.range_sensor: VL53L0X = VL53L0X(self._i2c, port=self.config.port, logging=self._logging)
+        self._range_period_ms: int = _DEFAULT_RANGE_PERIOD_MS  # inter-measurement period for continuous ranging
         # Static allocation of RangeEvent object to avoid allocating new memory for each event dispatch
         self._cached_range_event: "HexDriveApp.RangeEvent" = self.RangeEvent(0)
 
         self._colour_events_enabled: bool = False
         self._colour_interrupt_enabled: bool = False
-        self.colour_sensor: OPT4060 = OPT4060(self._i2c, logging=self._logging)
+        self.colour_sensor: OPT4060 = OPT4060(self._i2c, port=self.config.port, logging=self._logging)
         self._colour_period_ms: int = _DEFAULT_COLOUR_PERIOD_MS
         # Static allocation of ColourEvent object to avoid allocating new memory for each event dispatch
         self._cached_colour_event: "HexDriveApp.ColourEvent" = self.ColourEvent((0,0,0,0))
@@ -475,7 +482,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         diag_output = False
 
         # To be robust against missed interrupts from the distance sensor and colour sensor we read them here even if interrupts are in use
-        if not self._range_interrupt_enabled:
+        if not self._range_interrupt_enabled and (self._range_events_enabled or not i2c_mgr):
             # Range Sensor
             range_sensor = self.range_sensor
             if range_sensor.is_continuous:
@@ -491,7 +498,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 self._hexdiag.output(2, 0)
 
         # Currently never using interrupts for the colour sensor as it is not reliable on some modules, so we just poll it in the background update loop
-        if not self._colour_interrupt_enabled:
+        if not self._colour_interrupt_enabled and (self._colour_events_enabled or not i2c_mgr):
             # Colour Sensor
             colour_sensor = self.colour_sensor
             if colour_sensor.is_continuous:
@@ -840,11 +847,10 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 
 
     def set_range_period(self, period_ms: int) -> None:
-        """ Set the inter-measurement period for continuous ranging in milliseconds.
-            A value of 0 means back-to-back measurements as fast as the sensor allows. """
-        if period_ms < 0 or period_ms > 10000:
+        """Set the inter-measurement period for continuous ranging in milliseconds."""
+        if period_ms < _MIN_SENSOR_PERIOD_MS or period_ms > 10000:
             # Invalid period, do nothing
-            raise ValueError(f"D:{self.config.port}:Range Sensor period must be between 0 and 10000ms")
+            raise ValueError(f"D:{self.config.port}:Range Sensor period must be between {_MIN_SENSOR_PERIOD_MS} and 10000ms")
         if period_ms == self._range_period_ms:
             return  # No change needed
         self._range_period_ms = period_ms
@@ -981,11 +987,10 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 
 
     def set_colour_period(self, period_ms: int) -> None:
-        """ Set the inter-measurement period for continuous colour sensing in milliseconds.
-            A value of 0 means back-to-back measurements as fast as the sensor allows. """
-        if period_ms < 0 or period_ms > 10000:
+        """Set the inter-measurement period for continuous colour sensing in milliseconds."""
+        if period_ms < _MIN_SENSOR_PERIOD_MS or period_ms > 10000:
             # Invalid period, do nothing
-            raise ValueError(f"D:{self.config.port}:Colour Sensor period must be between 0 and 10000ms")
+            raise ValueError(f"D:{self.config.port}:Colour Sensor period must be between {_MIN_SENSOR_PERIOD_MS} and 10000ms")
         if period_ms == self._colour_period_ms:
             return  # No change needed
         self._colour_period_ms = period_ms
@@ -1321,7 +1326,7 @@ Each concrete driver must implement:
 
 class SensorBase:
     """Abstract base class for BadgeBot I2C sensor drivers."""
-    __slots__ = ("_i2c", "_ready", "_i2c_addr", "_interrupts", "_logging", "_continuous", "_period_ms", "_sequence", "_i2c_buffer_1", "_i2c_buffer_2")
+    __slots__ = ("_i2c", "_ready", "_i2c_addr", "_port", "_interrupts", "_logging", "_continuous", "_period_ms", "_i2c_buffer_1", "_i2c_buffer_2", "_job", "_job_sequence")
 
     # Sub-classes must override these
     I2C_ADDR = 0x00
@@ -1330,17 +1335,19 @@ class SensorBase:
     TYPE = "Unknown"
 
 
-    def __init__(self, i2c: I2C, i2c_addr: int, logging: bool = False, interrupts: bool = False):
+    def __init__(self, i2c: I2C, i2c_addr: int, port: int, logging: bool = False, interrupts: bool = False):
         self._i2c: I2C = i2c
         self._ready: bool = False
         self._i2c_addr: int = i2c_addr
+        self._port: int = port
         self._interrupts: bool = interrupts
         self._logging: bool = logging
         self._continuous: bool = False
-        self._period_ms: int = 0
-        self._sequence: int = 0
+        self._period_ms: int = self.READ_INTERVAL_MS
         self._i2c_buffer_1: bytearray = bytearray(1)
         self._i2c_buffer_2: bytearray = bytearray(2)
+        self._job = None  # i2c_mgr.Job | None - background step-job, for subclasses that use one
+        self._job_sequence: int = 0
 
 
     # ------------------------------------------------------------------
@@ -1383,6 +1390,8 @@ class SensorBase:
         """
         self._continuous = False
         if period_ms is not None:
+            if period_ms < _MIN_SENSOR_PERIOD_MS:
+                raise ValueError(f"period must be at least {_MIN_SENSOR_PERIOD_MS}ms")
             self._period_ms = period_ms
         if interrupts is not None:
             self._interrupts = interrupts
@@ -1420,10 +1429,7 @@ class SensorBase:
         if not self._ready:
             return None
         try:
-            result = self._read()
-            if result is not None:
-                self._sequence += 1
-            return result
+            return self._read()
         except Exception as e:          # pylint: disable=broad-exception-caught
             print(f"D:{self.NAME} read error: {e}")
             return None
@@ -1435,15 +1441,15 @@ class SensorBase:
         Call this after the sensor has been hardware reset so that the next
         `start`/`init` re-runs the full initialisation sequence.
         """
+        self._job_unregister()
         self._ready = False
         self._continuous = False
-        self._sequence = 0
 
 
     @property
     def sequence(self) -> int:
-        """Return the current measurement sequence number (incremented on each read)."""
-        return self._sequence
+        """Return the sequence number of the latest consumed background measurement."""
+        return self._job_sequence
 
     @property
     def is_ready(self) -> bool:
@@ -1472,6 +1478,43 @@ class SensorBase:
     @logging.setter
     def logging(self, value: bool):
         self._logging = value
+
+
+    # ------------------------------------------------------------------
+    # Generic step-job helpers - for subclasses whose _start/_stop/_read are
+    # implemented via a background i2c_mgr job rather than direct I2C calls.
+    # ------------------------------------------------------------------
+
+    def _job_register(self, steps, period_ms: int) -> bool:
+        """Register the background step-job, or retarget an already-registered one to a new
+        period. Returns True if a job is active afterwards."""
+        if i2c_mgr is None:
+            return True
+        if self._job is not None:
+            self._job.set_period(period_ms, force=True)
+            return True
+        self._job = i2c_mgr.add_job(self._port, self._i2c_addr, steps, period_ms=period_ms)
+        self._job_sequence = 0
+        return self._job is not None
+
+
+    def _job_unregister(self) -> None:
+        """Free the background step-job's slot, if one is registered."""
+        if self._job is not None:
+            self._job.unregister()
+            self._job = None
+        self._job_sequence = 0
+
+
+    def _job_poll(self, dest) -> bool:
+        """Copy the job's latest data into dest. Returns True if it is new since the last call."""
+        if self._job is None:
+            return False
+        seq = self._job.read_into(dest)
+        if seq is None or seq == self._job_sequence:
+            return False
+        self._job_sequence = seq
+        return True
 
 
     # ------------------------------------------------------------------
@@ -1612,20 +1655,27 @@ _DEFAULT_TUNING_SETTINGS = (
 
 class VL53L0X(SensorBase):
     """VL53L0X Time-of-Flight distance sensor driver."""
-    __slots__ = ("_stop_variable", "_last_range_mm", "_i2c_buffer_6", "_i2c_read_buffer_1", "_i2c_read_buffer_2")
+    __slots__ = ("_stop_variable", "_last_range_mm", "_i2c_buffer_6", "_job_buf")
 
     I2C_ADDR = _RANGE_I2C_ADDRESS
     NAME = "VL53L0X"
     TYPE = "Distance"
     READ_INTERVAL_MS = 100
 
-    def __init__(self, i2c: I2C, logging: bool = False, interrupts: bool = False):
-        super().__init__(i2c=i2c, i2c_addr=self.I2C_ADDR, logging=logging, interrupts=interrupts)
+    # Background i2c_mgr job: status byte -> abort if not ready -> range (2 bytes) -> clear interrupt.
+    _JOB_STEPS = (
+        (i2c_mgr.READ, _RESULT_INTERRUPT_STATUS, 1),
+        (i2c_mgr.CHECK, 0, _INTERRUPT_READY_MASK, 0x00),
+        (i2c_mgr.READ, _RESULT_RANGE_STATUS + 10, 2),
+        (i2c_mgr.WRITE, _SYSTEM_INTERRUPT_CLEAR, 1, b'\x01'),
+    ) if i2c_mgr is not None else ()
+
+    def __init__(self, i2c: I2C, port: int, logging: bool = False, interrupts: bool = False):
+        super().__init__(i2c=i2c, i2c_addr=self.I2C_ADDR, port=port, logging=logging, interrupts=interrupts)
         self._stop_variable: int = 0             # used to store the stop variable value for the VL53L0X sensor
         self._last_range_mm: int = 0             # last range reading in mm
         self._i2c_buffer_6: bytearray = bytearray(6)  # buffer for reading/writing 6 bytes at a time
-        self._i2c_read_buffer_1: bytearray = bytearray(1)  # buffer for reading 1 byte at a time
-        self._i2c_read_buffer_2: bytearray = bytearray(2)  # buffer for reading 2 bytes at a time
+        self._job_buf: bytearray = bytearray(3)  # status byte + 2-byte range, filled by the background job
 
         # With this sensor, even if we are not taking any notice of the interrupt signal, we still need to use the interrupt register
         # to determine when a measurement is ready, so we will always enable the interrupt register, but we will only use the interrupt pin if interrupts are enabled.
@@ -1717,15 +1767,11 @@ class VL53L0X(SensorBase):
 
 
     def _start(self) -> bool:
-        """Start continuous (interrupt-driven) ranging.
+        """Start continuous ranging and register the background i2c_mgr job that polls for new
+        measurements and clears the sensor's interrupt to re-arm it; call `read` to fetch the
+        latest value.
 
-        In continuous mode the sensor measures repeatedly on its own and asserts its interrupt line
-        each time a new reading is ready; call `read` from the interrupt handler to retrieve the value
-        and re-arm the sensor.
-
-        period_ms: inter-measurement period in milliseconds. 0 selects back-to-back mode (the
-                sensor measures as fast as it can); a positive value selects timed mode with the
-                requested gap between measurements.
+        period_ms: inter-measurement period in milliseconds.
 
         Returns:
             True on success, False on failure.
@@ -1733,25 +1779,22 @@ class VL53L0X(SensorBase):
 
         # Apply the per-device "stop variable" - required before (re)starting ranging.
         self._prepare_ranging()
-        if self._period_ms > 0:
-            # Timed continuous mode: the requested period must be scaled by the sensor's oscillator
-            # calibration value before it is written to the inter-measurement period register.
-            osc_calibrate_val = self._read_u16_be(_OSC_CALIBRATE_VAL)
-            if osc_calibrate_val != 0:
-                self._period_ms *= osc_calibrate_val
-            self._write_u32_be(_SYSTEM_INTERMEASUREMENT_PERIOD, self._period_ms)
-            mode = 0x04     # VL53L0X_REG_SYSRANGE_MODE_TIMED
-        else:
-            mode = 0x02     # VL53L0X_REG_SYSRANGE_MODE_BACKTOBACK
+        period_ms = self._period_ms
+        # Timed continuous mode: the requested period must be scaled by the sensor's oscillator
+        # calibration value before it is written to the inter-measurement period register.
+        osc_calibrate_val = self._read_u16_be(_OSC_CALIBRATE_VAL)
+        intermeasurement_period = period_ms * osc_calibrate_val if osc_calibrate_val != 0 else period_ms
+        self._write_u32_be(_SYSTEM_INTERMEASUREMENT_PERIOD, intermeasurement_period)
         # Clear the interrupt so the sensor can complete the next continuous measurement (and we guarantee an edge on the interrupt line for the first measurement).
         self._write_u8(_SYSTEM_INTERRUPT_CLEAR, 0x01)
         # Start continuous ranging in the requested mode.
-        self._write_u8(_SYSRANGE_START, mode)
-        return True
+        self._write_u8(_SYSRANGE_START, 0x04)  # VL53L0X_REG_SYSRANGE_MODE_TIMED
+        return self._job_register(self._JOB_STEPS, period_ms)
 
 
     def _stop(self) -> bool:
         """Stop continuous ranging and return the sensor to idle. Returns success or failure."""
+        self._job_unregister()
         self._write_u8(_SYSRANGE_START, 0x01)  # VL53L0X_REG_SYSRANGE_MODE_SINGLESHOT (halts continuous)
         # Clear the stored stop variable window (matches the reference driver's stopContinuous()).
         self._write_u8(0xFF, 0x01)
@@ -1768,43 +1811,25 @@ class VL53L0X(SensorBase):
         Call this after the sensor has been hardware reset via its XSHUT pin so that the next
         `start`/`init` re-runs the full initialisation sequence.
         """
+        self._job_unregister()
         self._ready = False
         self._last_range_mm = 0
 
-    # Local versions of I2C read and write with their own buffers so we don't clash with other uses as this is called from the interrupt handler.
-    @micropython.native
-    def _read_read_u8(self, reg: int) -> int:
-        self._i2c.readfrom_mem_into(self._i2c_addr, reg, self._i2c_read_buffer_1)
-        return self._i2c_read_buffer_1[0]
-
-    @micropython.native
-    def _read_write_u8(self, reg: int, value: int) -> None:
-        self._i2c.writeto_mem(self._i2c_addr, reg, bytes([value & 0xFF]))
-
-    @micropython.native
-    def _read_read_u16_be(self, reg: int) -> int:
-        self._i2c.readfrom_mem_into(self._i2c_addr, reg, self._i2c_read_buffer_2)
-        return (self._i2c_read_buffer_2[0] << 8) | self._i2c_read_buffer_2[1]
-
     @micropython.native
     def _read(self) -> int | None:
-        """Read the most recent range in millimetres and clear the data-ready interrupt.
-
-        Clearing the interrupt re-arms the sensor for the next measurement.
-
-        Returns:
-            The measured distance in mm, or None if the sensor is not ready or no measurement is
-            currently available.
-        """
-        # A single status read is sufficient: the data-ready interrupt bit confirms a fresh
-        # measurement is waiting (we normally get here because the interrupt line already fired).
-        if (self._read_read_u8(_RESULT_INTERRUPT_STATUS) & _INTERRUPT_READY_MASK) == 0:
-            return None
-        # The range value lives 10 bytes into the RESULT_RANGE_STATUS block in ST's register map;
-        # this offset matches the reference driver.
-        dist_mm = self._read_read_u16_be(_RESULT_RANGE_STATUS + 10)
-        # Clear the interrupt so the sensor can complete the next continuous measurement.
-        self._read_write_u8(_SYSTEM_INTERRUPT_CLEAR, 0x01)
+        """Return the most recent range in millimetres, or None if no new measurement is available."""
+        if i2c_mgr is not None:
+            if not self._job_poll(self._job_buf):
+                return None
+            dist_mm = (self._job_buf[1] << 8) | self._job_buf[2]
+        else:
+            self._i2c.readfrom_mem_into(self._i2c_addr, _RESULT_INTERRUPT_STATUS, self._i2c_buffer_1)
+            if (self._i2c_buffer_1[0] & _INTERRUPT_READY_MASK) == 0:
+                return None
+            self._i2c.readfrom_mem_into(self._i2c_addr, _RESULT_RANGE_STATUS + 10, self._i2c_buffer_2)
+            dist_mm = (self._i2c_buffer_2[0] << 8) | self._i2c_buffer_2[1]
+            self._write_u8(_SYSTEM_INTERRUPT_CLEAR, 0x01)
+            self._job_sequence += 1
         self._last_range_mm = dist_mm
         return dist_mm
 
@@ -2185,7 +2210,7 @@ class OPT4060(SensorBase):
       "blue"  — Blue channel
       "w"     — Clear / White channel
     """
-    __slots__ = ("_overload", "_last_colour", "_last_colour_hue", "_last_colour_saturation", "_calibrated", "_black_reference", "_white_reference", "_white_gains", "_i2c_buffer_16", "_i2c_read_buffer_2", "_conversion_time")
+    __slots__ = ("_overload", "_last_colour", "_last_colour_hue", "_last_colour_saturation", "_calibrated", "_black_reference", "_white_reference", "_white_gains", "_job_buf", "_conversion_time")
 
 
     I2C_ADDR = _COLOUR_I2C_ADDRESS
@@ -2193,9 +2218,15 @@ class OPT4060(SensorBase):
     TYPE = "Colour"
     READ_INTERVAL_MS = 10
 
+    # Background i2c_mgr job: status (2 bytes) -> abort if not ready -> burst-read all 4 channels (16 bytes).
+    _JOB_STEPS = (
+        (i2c_mgr.READ, _REG_RES_CTRL, 2),
+        (i2c_mgr.CHECK, 1, _RES_CTRL_CONV_READY_MASK, 0x00),
+        (i2c_mgr.READ, _REG_RED_MSB, 16),
+    ) if i2c_mgr is not None else ()
 
-    def __init__(self, i2c: I2C, logging: bool = False, interrupts: bool = False) -> None:
-        super().__init__(i2c=i2c, i2c_addr=self.I2C_ADDR, logging=logging, interrupts=interrupts)
+    def __init__(self, i2c: I2C, port: int, logging: bool = False, interrupts: bool = False) -> None:
+        super().__init__(i2c=i2c, i2c_addr=self.I2C_ADDR, port=port, logging=logging, interrupts=interrupts)
         self._overload: bool = False                    # True if the last reading was saturated/overflowed
         self._last_colour: tuple[int, int, int, int] | None = None  # Last RGBC reading
         self._last_colour_hue: int = 0                  # Last colour hue (0-3600)
@@ -2204,8 +2235,7 @@ class OPT4060(SensorBase):
         self._black_reference: tuple[int, int, int, int] | None = None  # Black reference RGBC values
         self._white_reference: tuple[int, int, int, int] | None = None  # White reference RGBC values
         self._white_gains: tuple[int, int, int, int] = _DEFAULT_WHITE_GAINS # white reference gains for RGBC channels, scaled by _WHITE_CAL_SCALE
-        self._i2c_buffer_16: bytearray = bytearray(16)  # Pre-allocated 16-byte array
-        self._i2c_read_buffer_2: bytearray = bytearray(2)  # Pre-allocated 2-byte array for I2C reads
+        self._job_buf: bytearray = bytearray(18 if i2c_mgr is not None else 16)
         self._conversion_time: int = 0                  # Conversion time in milliseconds
 
 
@@ -2385,44 +2415,44 @@ class OPT4060(SensorBase):
         if abs(self._period_ms - self._conversion_time) > _CONV_TIME_TOLERANCE_MS:
             self._set_conversion_time(self._best_conversion_time(self._period_ms))
 
-        # Enter continuous conversion mode; the sensor re-arms itself and asserts INT as each set of
-        # channel readings completes for the interrupt handler to service.
+        # Enter continuous conversion mode; the sensor re-arms itself as each set of channel
+        # readings completes for the background i2c_mgr job to fetch.
         _ = self._read_u16_be(_REG_RES_CTRL)
-        return True
+        return self._job_register(self._JOB_STEPS, self._period_ms)
 
 
     def _stop(self) -> bool:
         """Stop continuous sensing and return the sensor to idle. Returns success or failure."""
+        self._job_unregister()
         self._set_mode(_MODE_POWERDOWN)
         return True
 
 
     @micropython.native
-    def _read_read_u16_be(self, reg: int) -> int:
-        self._i2c.readfrom_mem_into(self._i2c_addr, reg, self._i2c_read_buffer_2)
-        return (self._i2c_read_buffer_2[0] << 8) | self._i2c_read_buffer_2[1]
-
-
-    @micropython.native
     def _read(self) -> tuple[int, int, int, int] | None:
-        # is there a new reading available? (CONV_READY bit in RES_CTRL register)
-        st = self._read_read_u16_be(_REG_RES_CTRL)
-        if st & _RES_CTRL_CONV_READY_MASK:
-            # Read the overload flag (saturation/overflow) and store it for later retrieval.
-            self._overload = bool(st & _RES_CTRL_OVERLOAD_MASK)
+        """Return the latest RGBW reading, or None if no new measurement is available."""
+        if i2c_mgr is not None:
+            if not self._job_poll(self._job_buf):
+                return None
+            st = (self._job_buf[0] << 8) | self._job_buf[1]
+            data_offset = 2
+        else:
+            self._i2c.readfrom_mem_into(self._i2c_addr, _REG_RES_CTRL, self._i2c_buffer_2)
+            st = (self._i2c_buffer_2[0] << 8) | self._i2c_buffer_2[1]
+            if (st & _RES_CTRL_CONV_READY_MASK) == 0:
+                return None
+            self._i2c.readfrom_mem_into(self._i2c_addr, _REG_RED_MSB, self._job_buf)
+            data_offset = 0
+            self._job_sequence += 1
+        self._overload = bool(st & _RES_CTRL_OVERLOAD_MASK)
 
-            # Burst-read all 4 channels (8 registers × 2 bytes = 16 bytes)
-            self._i2c.readfrom_mem_into(self._i2c_addr, _REG_RED_MSB, self._i2c_buffer_16)
-            raw = bytes(self._i2c_buffer_16)
+        r = self._decode_channel(self._job_buf, data_offset)
+        g = self._decode_channel(self._job_buf, data_offset + 4)
+        b = self._decode_channel(self._job_buf, data_offset + 8)
+        w = self._decode_channel(self._job_buf, data_offset + 12)
 
-            r = self._decode_channel(raw, 0)
-            g = self._decode_channel(raw, 4)
-            b = self._decode_channel(raw, 8)
-            w = self._decode_channel(raw, 12)
-
-            self._last_colour = (r, g, b, w)
-            return r, g, b, w
-        return None
+        self._last_colour = (r, g, b, w)
+        return r, g, b, w
 
 
 #---------------------------------------------------------------------------------
@@ -2499,7 +2529,7 @@ class OPT4060(SensorBase):
 
     @staticmethod
     @micropython.native
-    def _decode_channel(buf: bytes, offset: int) -> int:
+    def _decode_channel(buf: bytes | bytearray, offset: int) -> int:
         """Decode a single channel from a 4-byte (MSB+LSB register) slice.
 
         Each channel occupies two consecutive 16-bit big-endian registers:
