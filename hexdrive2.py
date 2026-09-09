@@ -25,6 +25,7 @@ import app
 from tildagon import Pin as ePin
 import micropython
 
+# There is a PR to introduce i2c_mgr support for managing I2C buses efficiently, not in version 2.2.0.
 try:
     import i2c_mgr
 except ImportError:
@@ -255,7 +256,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         "_range_events_enabled", "_range_interrupt_enabled",
         "_colour_events_enabled", "_colour_interrupt_enabled","_background_update_period",)
 
-    VERSION = 3        # Increment this when making changes to the app that require the hexpansion EEPROM app to be re-flashed with the new code.
+    VERSION = 4        # Increment this when making changes to the app that require the hexpansion EEPROM app to be re-flashed with the new code.
 
 
     class RangeEvent(Event):
@@ -1025,12 +1026,13 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 if self._logging:
                     print(f"D:{self.config.port}:Stop")
                 self.deinit()
+                eventbus.remove(RequestStopAppEvent, self._handle_stop_app, self)
+                eventbus.remove(HexpansionInsertionEvent, self._handle_hexpansion_change_event, self)
+                eventbus.remove(HexpansionRemovalEvent, self._handle_hexpansion_change_event, self)
                 # The badge HexpansionManagerApp tidies up the LS and HS pins when a hexpansion app is removed
         except (AttributeError, TypeError):
             pass
-        eventbus.remove(RequestStopAppEvent, self._handle_stop_app, self)
-        eventbus.remove(HexpansionInsertionEvent, self._handle_hexpansion_change_event, self)
-        eventbus.remove(HexpansionRemovalEvent, self._handle_hexpansion_change_event, self)
+
 
 
     async def _handle_hexpansion_change_event(self, event):
