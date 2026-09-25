@@ -228,7 +228,6 @@ class HexDiagnostics():
             hexdiag_port = None
             self._diag_config = None
 
-    @micropython.native
     def output(self, index: int, value: int):
         """Output diagnostic values to the HS pins on the diagnostics hexpansion, for measurement with an oscilloscope"""
         if self._diag_config:
@@ -462,7 +461,6 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 
     # Run background_update() in an asyncio task so sensor polling / keep-alive runs at a steady interval.
     # The update period is controlled by self._background_update_period (see set_background_update_period()).
-    @micropython.native
     async def background_task(self):
         """Background task loop for handling time-based updates. This runs independently of the main update/draw loop
            and is suitable for tasks that need to run at a consistent interval regardless of the current state or drawing performance."""
@@ -478,7 +476,6 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             last_time = cur_time
 
 
-    @micropython.native
     def background_update(self, delta: int):
         """ This is called from the main loop of the BadgeOS to allow the app to do any background processing it needs to do. """
 
@@ -1256,7 +1253,6 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         return False
 
 
-    #@micropython.native
     def _handle_range_interrupt(self, _pin):
         """Distance-sensor data-ready interrupt handler (a *bound* method - see `range_enable`).
 
@@ -1288,7 +1284,6 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 # PRIVATE methods
 #---------------------------------------------------------------------------------
 
-    #@micropython.native
     def _handle_colour_interrupt(self, _pin):
         """Colour-sensor data-ready interrupt handler (a *bound* method - see `colour_enable`).
 
@@ -1427,7 +1422,6 @@ class SensorBase:
             return False
 
 
-    @micropython.native
     def read(self) -> tuple[int,int,int,int] | int | None:
         """Return the latest measurement.
         Returns None on failure.
@@ -1839,7 +1833,6 @@ class VL53L0X(SensorBase):
         self._ready = False
         self._last_range_mm = 0
 
-    @micropython.native
     def _read(self) -> int | None:
         """Return the most recent range in millimetres, or None if no new measurement is available."""
         if i2c_mgr is not None and not self._interrupts:
@@ -2364,7 +2357,6 @@ class OPT4060(SensorBase):
         print(f"D:gains: {self._white_gains}")
 
 
-    #@micropython.native
     def apply_white_reference(self, colour: tuple[int, int, int, int] | None = None) -> tuple[int, int, int, int]:
         """Apply white reference gains to raw RGBC values and return adjusted RGBC tuple."""
         if colour is None:
@@ -2455,7 +2447,6 @@ class OPT4060(SensorBase):
         return True
 
 
-    @micropython.native
     def _read(self) -> tuple[int, int, int, int] | None:
         """Return the latest RGBW reading, or None if no new measurement is available."""
         if i2c_mgr is not None and not self._interrupts:
@@ -2576,7 +2567,7 @@ class OPT4060(SensorBase):
 
 
     @staticmethod
-    #@micropython.native
+    @micropython.native
     def _reference_to_gains(black: tuple[int, int, int, int], white: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
         ref_r = max(white[0] - black[0], 1)
         ref_g = max(white[1] - black[1], 1)
