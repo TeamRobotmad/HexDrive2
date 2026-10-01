@@ -71,7 +71,7 @@ _EXTENDED_HEADER_FLAG_INITIALISED         = const(0x8000)  # Flag indicating tha
 _DEFAULT_PWM_FREQ = const(20000)           # 20kHz is a good default for motors as it is above the audible range for most people and works with most motors and ESCs
 _DEFAULT_SERVO_FREQ = const(50)            # 50Hz = 20mS period
 _DEFAULT_KEEP_ALIVE_PERIOD = const(1000)   # 1 second
-_DEFAULT_BACKGROUND_UPDATE_PERIOD = const(50)  # 50ms for background updates
+_DEFAULT_BACKGROUND_UPDATE_PERIOD = const(100)  # 100ms for background updates
 _DEFAULT_RANGE_PERIOD_MS = const(100)      # default inter-measurement period (ms) for continuous distance ranging
 _DEFAULT_COLOUR_PERIOD_MS = const(100)     # default inter-measurement period (ms) for continuous colour readings
 _MAX_NUM_CHANNELS = const(4)               # Max number of PWM channels supported by any type of HexDrive (Hexpansion limitation, not BadgeBot limit)
@@ -246,7 +246,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         "config", "_logging", "_i2c", "_i2c_buffer_32", "_hexdrive_type",
         "_keep_alive_period", "_power_state", "_pwm_setup",
         "_time_since_last_update", "_outputs_energised",
-        "pwm_outputs", "_pwm_pin_index","_freq", "_motor_output", "_extended_header",
+        "pwm_outputs", "_pwm_pin_index","_freq", "_motor_output", "_motor_requests", "_pwm_requests", "_extended_header",
         "_time_since_last_sensor_check",
         "range_sensor", "_range_period_ms", "colour_sensor",
         "_colour_period_ms", "_power_control", "_led_control",
@@ -255,7 +255,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         "_range_events_enabled", "_range_interrupt_enabled",
         "_colour_events_enabled", "_colour_interrupt_enabled","_background_update_period",)
 
-    VERSION = 4        # Increment this when making changes to the app that require the hexpansion EEPROM app to be re-flashed with the new code.
+    VERSION = 9        # Increment this when making changes to the app that require the hexpansion EEPROM app to be re-flashed with the new code.
 
 
     class RangeEvent(Event):
@@ -314,6 +314,8 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
         self._time_since_last_update: int = 0
         self._outputs_energised: bool = False
         self.pwm_outputs: list[PWM | None] = [None] * _MAX_NUM_CHANNELS
+        self._motor_requests = [0] * self._hexdrive_type.motors
+        self._pwm_requests = [0] * _MAX_NUM_CHANNELS
         self._pwm_pin_index: list[int] = [-1] * _MAX_NUM_CHANNELS                  # which physical pin is being used for each logical channel (or -1 if not in use)
         self._freq: list[int] = [0] * _MAX_NUM_CHANNELS
         if self._hexdrive_type.motors > 0:
@@ -478,7 +480,13 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
 
     def background_update(self, delta: int):
         """ This is called from the main loop of the BadgeOS to allow the app to do any background processing it needs to do. """
+        if not self._range_interrupt_enabled and (self._range_events_enabled or not i2c_mgr):
+            self._poll_range_background()
+        if not self._colour_interrupt_enabled and (self._colour_events_enabled or not i2c_mgr):
+            self._poll_colour_background()
+        self._update_keep_alive(delta)
 
+    def _poll_range_background(self):
         #hexdiag.output(3, 1)
         #hexdiag.output(0, 1)
         #diag_output = False
@@ -499,6 +507,7 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                     eventbus.emit(self._cached_range_event)
                 #hexdiag.output(2, 0)
 
+    def _poll_colour_background(self):
         # Currently never using interrupts for the colour sensor as it is not reliable on some modules, so we just poll it in the background update loop
         if not self._colour_interrupt_enabled and (self._colour_events_enabled or not i2c_mgr):
             # Colour Sensor
@@ -510,13 +519,16 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 #hexdiag.output(1, 1)
                 # Checking the state of the colour sensor interrupt pin takes I2C communication with the AW9523 chip,
                 # so we may aswell assume it is active and use the I2C time to read the status register of the sensor instead.
-                measurement = colour_sensor.read()
+                measurement = colour_sensor.poll()
                 if measurement is not None and self._colour_events_enabled:
                     # we read the colour from the sensor class rather than using the return from read() to keep the linter quiet
-                    self._cached_colour_event.colour = measurement
-                    eventbus.emit(self._cached_colour_event)
+                    measurement = colour_sensor.colour
+                    if measurement is not None:
+                        self._cached_colour_event.colour = measurement
+                        eventbus.emit(self._cached_colour_event)
                 #hexdiag.output(1, 0)
 
+    def _update_keep_alive(self, delta):
         # Keep Alive
         if self._pwm_setup and self._outputs_energised:
             # Check keep alive period and turn off PWM outputs if exceeded
@@ -527,16 +539,29 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
                 # First time the keep alive period has expired so report it
                 if self._logging:
                     print(f"D:{self.config.port}:Timeout")
-                for channel,pwm in enumerate(self.pwm_outputs):
-                    if pwm is not None:
-                        try:
-                            if self._pwm_pin_index[channel] >= 0:
-                                pwm.duty_u16(0)
-                        except Exception as e:          # pylint: disable=broad-except
-                            print(self._pwm_log_string(channel) + f"Off failed {e}")
-                            self.pwm_outputs[channel] = None  # Tidy Up
-                            self._pwm_pin_index[channel] = -1
-                            self._freq[channel] = 0
+                self._stop_timed_out_outputs()
+
+    def _stop_timed_out_outputs(self):
+        channel = 0
+        while channel < len(self.pwm_outputs):
+            self._stop_pwm_checked(channel)
+            channel += 1
+
+    def _stop_pwm_checked(self, channel):
+        try:
+            self._stop_pwm(channel)
+        except Exception:  # pylint: disable=broad-exception-caught
+            self._discard_failed_pwm(channel)
+
+    def _stop_pwm(self, channel):
+        if self.pwm_outputs[channel] is not None and self._pwm_pin_index[channel] >= 0:
+            self.pwm_outputs[channel].duty_u16(0)
+
+    def _discard_failed_pwm(self, channel):
+        print(self._pwm_log_string(channel) + "Off failed")
+        self.pwm_outputs[channel] = None
+        self._pwm_pin_index[channel] = -1
+        self._freq[channel] = 0
 
         #if diag_output:
         #    hexdiag.output(3, 0)
@@ -782,51 +807,64 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
             and a value of 0 will stop the motor. """
         if len(outputs) > self._hexdrive_type.motors:
             return False
-        for motor, output in enumerate(outputs):
+        motor = 0
+        while motor < len(outputs):
+            output = outputs[motor]
             if abs(output) > 65535:
                 return False
             if output == self._motor_output[motor]:
                 # no change in output for this motor so skip to the next one
+                motor += 1
                 continue
-            try:
-                # if the output is changing direction then we need to switch which signal is being driven as the PWM output
-                # rather than test for change of direction and also test that pwm_outputs to be disabled exists we just do the latter check.
-                # if the output is actaully going to be 0 then it doesn't matter which output is enabled or disabled as both will be set to 0 anyway.
-                channel_to_enable  = (motor<<1)   if output > 0 else ((motor<<1)+1)
-                channel_to_disable = (motor<<1)+1 if output > 0 else (motor<<1)
-                pin_to_disable = self._pwm_pin_index[channel_to_disable]
-                if 0 != output:
-                    # if the new output is not 0 then we need to switch the active output to the new one
-                    # switch off the currently active output before switching the other one on to prevent both outputs being on at the same time
-                    pwm_to_disable = self.pwm_outputs[channel_to_disable]
-                    if pwm_to_disable is not None and pin_to_disable >= 0:
-                        pwm_to_disable.deinit()
-                        self.config.pin[pin_to_disable].init(mode=Pin.OUT)
-                        self.config.pin[pin_to_disable].value(0)
-                        self._pwm_pin_index[channel_to_disable] = -1
-                        if self._logging:
-                            print(self._pwm_log_string(channel_to_disable) + " deinit")
-                            print(f"D:{self.config.port}:pin{pin_to_disable}=Off")
-                else:
-                    # if the new output is 0 then we can just switch off the currently active output and leave the other one off for now.
-                    pwm_to_switch_off = self.pwm_outputs[channel_to_disable]
-                    if pwm_to_switch_off is not None and pin_to_disable >= 0:
-                        pwm_to_switch_off.duty_u16(0)
-                        if self._logging:
-                            print(f"D:{self.config.port}:pin{pin_to_disable}=0 duty")
-
-                if 0 != output or self._pwm_pin_index[channel_to_enable] >= 0:
-                    # if channel_to_enable is NOT already active and new output is 0 then we can leave it off for now.
-                    # otherwise we need to set the new output value
-                    self._set_pwmoutput(channel_to_enable, abs(output))
-            except Exception as e:          # pylint: disable=broad-except
-                print(f"D:{self.config.port}:Motor{motor}:{output} set failed {e}")
+            self._motor_requests[motor] = output
+            if not self._set_motor_checked(motor):
                 return False
             self._motor_output[motor] = output
             if output != 0:
                 self._outputs_energised = True
+            motor += 1
         self._time_since_last_update = 0
         return True
+
+    def _set_motor_checked(self, motor):
+        try:
+            return self._set_motor(motor)
+        except Exception:  # pylint: disable=broad-exception-caught
+            self._report_motor_error(motor)
+            return False
+
+    def _report_motor_error(self, motor):
+        print(f"D:{self.config.port}:Motor{motor}:{self._motor_requests[motor]} set failed")
+
+    def _set_motor(self, motor):
+        output = self._motor_requests[motor]
+        channel = (motor << 1) if output > 0 else (motor << 1) + 1
+        self._disable_motor_channel(channel ^ 1, output != 0)
+        if output != 0 or self._pwm_pin_index[channel] >= 0:
+            return self._set_pwmoutput(channel, abs(output))
+        return True
+
+    def _disable_motor_channel(self, channel, deinit):
+        pwm = self.pwm_outputs[channel]
+        pin = self._pwm_pin_index[channel]
+        if pwm is None or pin < 0:
+            return
+        if deinit:
+            pwm.deinit()
+            self.config.pin[pin].init(mode=Pin.OUT)
+            self.config.pin[pin].value(0)
+            self._pwm_pin_index[channel] = -1
+        else:
+            pwm.duty_u16(0)
+        if self._logging:
+            self._log_motor_disabled(channel, pin, deinit)
+
+    def _log_motor_disabled(self, channel, pin, deinit):
+        if deinit:
+            print(self._pwm_log_string(channel) + " deinit")
+            print(f"D:{self.config.port}:pin{pin}=Off")
+        else:
+            print(f"D:{self.config.port}:pin{pin}=0 duty")
 
 
 #---------------------------------------------------------------------------------
@@ -1087,36 +1125,48 @@ class HexDriveApp(app.App):         # pylint: disable=no-member
     def _set_pwmoutput(self, channel: int, duty_cycle: int) -> bool:
         if duty_cycle < 0 or duty_cycle > 65535:
             return False
+        self._pwm_requests[channel] = duty_cycle
+        return self._write_pwm_checked(channel)
+
+    def _write_pwm_checked(self, channel):
         try:
-            physical_pin_index = 3 - channel    # The physical pin index is the reverse of the channel number (0-3) for the 4 PWM outputs on the HexDrive2
-            pwm = self.pwm_outputs[channel]
-            if pwm is None:
-                # Channel hasn't been setup yet so we need to initialise it from scratch
-                pin = self.config.pin[physical_pin_index]
-                # Micropython v1.28 generates a spurious warning when we try to initialise a PWM on a pin that was previously used.
-                # "W (557771) ledc: GPIO 47 is not usable, maybe conflict with others"
-                pwm = PWM(pin, freq = self._freq[channel])
-                pwm.duty_u16(duty_cycle)
-                self.pwm_outputs[channel] = pwm
-                self._pwm_pin_index[channel] = physical_pin_index
-                if self._logging:
-                    print(self._pwm_log_string(channel) + f"{self.pwm_outputs[channel]} created")
-                return True
-            if self._pwm_pin_index[channel] < 0:
-                pwm.init(freq=self._freq[channel])
-                self._pwm_pin_index[channel] = physical_pin_index
-                if self._logging:
-                    print(self._pwm_log_string(channel) + f"{self.pwm_outputs[channel]} init")
-            if duty_cycle != pwm.duty_u16():
-                pwm.duty_u16(duty_cycle)
-                if self._logging:
-                    print(self._pwm_log_string(channel) + f"{duty_cycle}")
-            else:
-                print(self._pwm_log_string(channel) + f"{duty_cycle} (no change)")
-        except Exception as e:              # pylint: disable=broad-except
-            print(self._pwm_log_string(channel) + f"set {duty_cycle} failed {e}")
+            return self._write_pwm(channel)
+        except Exception:  # pylint: disable=broad-exception-caught
+            self._report_pwm_error(channel)
             return False
+
+    def _report_pwm_error(self, channel):
+        print(self._pwm_log_string(channel) + f"set {self._pwm_requests[channel]} failed")
+
+    def _write_pwm(self, channel):
+        pwm = self.pwm_outputs[channel]
+        if pwm is None:
+            return self._create_pwm(channel)
+        if self._pwm_pin_index[channel] < 0:
+            pwm.init(freq=self._freq[channel])
+            self._pwm_pin_index[channel] = 3 - channel
+            if self._logging:
+                self._log_pwm_init(channel)
+        if self._pwm_requests[channel] != pwm.duty_u16():
+            pwm.duty_u16(self._pwm_requests[channel])
+        if self._logging:
+            self._log_pwm_duty(channel)
         return True
+
+    def _create_pwm(self, channel):
+        pwm = PWM(self.config.pin[3 - channel], freq=self._freq[channel])
+        pwm.duty_u16(self._pwm_requests[channel])
+        self.pwm_outputs[channel] = pwm
+        self._pwm_pin_index[channel] = 3 - channel
+        if self._logging:
+            self._log_pwm_init(channel)
+        return True
+
+    def _log_pwm_init(self, channel):
+        print(self._pwm_log_string(channel) + f"{self.pwm_outputs[channel]} init")
+
+    def _log_pwm_duty(self, channel):
+        print(self._pwm_log_string(channel) + f"{self._pwm_requests[channel]}")
 
 
     def _pwm_log_string(self, channel: int | None) -> str:
@@ -1430,9 +1480,12 @@ class SensorBase:
             return None
         try:
             return self._read()
-        except Exception as e:          # pylint: disable=broad-exception-caught
-            print(f"D:{self.NAME} read error: {e}")
+        except Exception:          # pylint: disable=broad-exception-caught
+            self._report_read_error()
             return None
+
+    def _report_read_error(self):
+        print(f"D:{self.NAME} read error")
 
 
     def reset(self) -> None:
@@ -1527,9 +1580,7 @@ class SensorBase:
     def _on_job_data(self, _job) -> None:
         """Background job irq handler (see i2c_mgr.Job.irq) - decodes the newest sample as soon
         as it is ready rather than waiting for the next active read()."""
-        #hexdiag.output(0, 1)
         self.read()
-        #hexdiag.output(0, 0)
 
 
     # ------------------------------------------------------------------
@@ -2117,76 +2168,66 @@ HUE_MAGENTA_MAX = const(3400)
 
 #viper not currently in use so we can return a tupple
 #@micropython.viper
-def _lookup_colour_math_viper(r: int, g: int, b: int, clear: int) -> tuple[int, int, int]:
+def _lookup_colour_math_viper(r: int, g: int, b: int, clear: int, result: list | None = None) -> tuple[int, int, int] | None:
     """Bare-metal Viper math processor for fast HSV mapping.
-       Returns a tuple of (colour_id, hue, saturation) where colour_id is an integer ID for the colour
-        and hue is the hue value in the range 0-3600,
-        and saturation is the saturation value in the range 0-100.
+       Returns (colour_id, hue, saturation), or writes those values to result when supplied.
     """
-    h = 1200 # default hue for achromatic (gray) colours - meaningless but avoids having to cope with Null/None values in the calling code.
+    if result is None:
+        return _lookup_colour_tuple(r, g, b, clear)
+    max_c = max(r, g, b)
+    _colour_hsv_into(r, g, b, result)
+    result[0] = _colour_id(result[1], result[2], max_c, clear)
+    if max_c != 0 and result[2] < _ACHROMATIC_SATURATION_THRESHOLD:
+        result[1] = 0
+    return None
 
-    # Inline max calculation to bypass standard Python max() function
-    max_c = r
-    if g > max_c:
-        max_c = g
-    if b > max_c:
-        max_c = b
+def _lookup_colour_tuple(red, green, blue, clear):
+    result = [0, 0, 0]
+    _lookup_colour_math_viper(red, green, blue, clear, result)
+    return (result[0], result[1], result[2])
 
-    if max_c == 0:
-        return ID_BLACK, h, 0
+def _colour_hsv_into(red, green, blue, result):
+    delta = max(red, green, blue) - min(red, green, blue)
+    if max(red, green, blue) == 0:
+        result[1] = 1200
+        result[2] = 0
+        return
+    result[2] = (100 * delta) // max(red, green, blue)
+    result[1] = _colour_hue(red, green, blue, delta) if result[2] > 0 else 1200
 
-    # Inline min calculation to bypass standard Python min() function
-    min_c = r
-    if g < min_c:
-        min_c = g
-    if b < min_c:
-        min_c = b
+def _colour_hue(red, green, blue, delta):
+    if red >= green and red >= blue:
+        return 6 * ((((100 * (green - blue)) // delta) + 600) % 600)
+    if green >= blue:
+        return 6 * (((100 * (blue - red)) // delta) + 200)
+    return 6 * (((100 * (red - green)) // delta) + 400)
 
-    delta = max_c - min_c
-
-    # Saturation (0 – 100)
-    s = (100 * delta) // max_c
-
-    # --- Chromatic branch: compute hue (0 – 3600) ---
-    if s > 0:
-        if max_c == r:
-            # Note: Viper handles modulo (%) on positive integers best.
-            # Adding a safe upper boundary ensures value is positive before mod.
-            h = 6 * ((((100 * (g - b)) // delta) + 600) % 600)
-        elif max_c == g:
-            h = 6 * (((100 * (b - r)) // delta) + 200)
-        else:
-            h = 6 * (((100 * (r - g)) // delta) + 400)
-
-    # --- Achromatic branch (low saturation) ---
-    if s < _ACHROMATIC_SATURATION_THRESHOLD:
-        brightness_ref = clear if clear > 0 else max_c
-        reflectance = 0
-        if brightness_ref > 0:
-            reflectance = (100 * max_c) // brightness_ref
-
+def _colour_id(hue, saturation, maximum, clear):
+    if maximum == 0:
+        return ID_BLACK
+    if saturation < _ACHROMATIC_SATURATION_THRESHOLD:
+        reflectance = (100 * maximum) // (clear if clear > 0 else maximum) if clear > 0 or maximum > 0 else 0
         if reflectance < _ACHROMATIC_REFLECTANCE_LOW_THRESHOLD:
-            return ID_BLACK, 0, s
+            return ID_BLACK
         if reflectance > _ACHROMATIC_REFLECTANCE_HIGH_THRESHOLD:
-            return ID_WHITE, 0, s
-        return ID_GRAY, 0, s
+            return ID_WHITE
+        return ID_GRAY
+    if hue < HUE_RED_MAX or hue >= HUE_MAGENTA_MAX:
+        return ID_RED
+    if hue < HUE_ORANGE_MAX:
+        return ID_ORANGE
+    if hue < HUE_YELLOW_MAX:
+        return ID_YELLOW
+    if hue < HUE_GREEN_MAX:
+        return ID_GREEN
+    if hue < HUE_CYAN_MAX:
+        return ID_CYAN
+    if hue < HUE_BLUE_MAX:
+        return ID_BLUE
+    return ID_MAGENTA
 
-    # --- Chromatic branch: compute hue (0 – 3600) ---
-
-    # Hue classification
-    if h < HUE_RED_MAX or h >= HUE_MAGENTA_MAX:
-        return ID_RED, h, s
-    if h < HUE_ORANGE_MAX:
-        return ID_ORANGE, h, s
-    if h < HUE_YELLOW_MAX:
-        return ID_YELLOW, h, s
-    if h < HUE_GREEN_MAX:
-        return ID_GREEN, h, s
-    if h < HUE_CYAN_MAX:
-        return ID_CYAN, h, s
-    if h < HUE_BLUE_MAX:
-        return ID_BLUE, h, s
-    return ID_MAGENTA, h, s
+def _scaled_white_value(value, gain):
+    return value * (gain >> 14) + (value >> 14) * (gain & 16383) + (((value & 16383) * (gain & 16383) + 8192) >> 14)
 
 
 class ColourLookup:
@@ -2207,16 +2248,16 @@ class ColourLookup:
     )
 
     @staticmethod
-    def rgbw_to_str(colour: tuple[int, int, int, int]) -> tuple[str, int, int]:
+    def rgbw_to_str(colour: tuple[int, int, int, int] | list, result: list | None = None) -> tuple[str, int, int] | str:
         """User-facing entry point that bridges tuples to native Viper math."""
-        # Unpack the tuple cleanly into 4 distinct integers
-        r, g, b, clear = colour
+        if result is None:
+            return ColourLookup._tuple_name(_lookup_colour_math_viper(colour[0], colour[1], colour[2], colour[3]))
+        _lookup_colour_math_viper(colour[0], colour[1], colour[2], colour[3], result)
+        return ColourLookup._COLOUR_TABLE[result[0]]
 
-        # Fire the hardware-accelerated Viper calculation engine
-        colour_id, hue, saturation = _lookup_colour_math_viper(r, g, b, clear)
-
-        # Instantly resolve the ID code back to an interned string token
-        return ColourLookup._COLOUR_TABLE[colour_id], hue, saturation
+    @staticmethod
+    def _tuple_name(values):
+        return (ColourLookup._COLOUR_TABLE[values[0]], values[1], values[2])
 
 
 class OPT4060(SensorBase):
@@ -2227,7 +2268,7 @@ class OPT4060(SensorBase):
       "blue"  — Blue channel
       "w"     — Clear / White channel
     """
-    __slots__ = ("_overload", "_last_colour", "_last_colour_hue", "_last_colour_saturation", "_calibrated", "_black_reference", "_white_reference", "_white_gains", "_job_buf", "_conversion_time")
+    __slots__ = ("_overload", "_last_colour", "_last_colour_buffer", "_has_colour", "_last_colour_hue", "_last_colour_saturation", "_calibrated", "_black_reference", "_white_reference", "_white_gains", "_job_buf", "_conversion_time", "_colour_work_buffer")
 
 
     I2C_ADDR = _COLOUR_I2C_ADDRESS
@@ -2246,6 +2287,8 @@ class OPT4060(SensorBase):
         super().__init__(i2c=i2c, i2c_addr=self.I2C_ADDR, port=port, logging=logging, interrupts=interrupts)
         self._overload: bool = False                    # True if the last reading was saturated/overflowed
         self._last_colour: tuple[int, int, int, int] | None = None  # Last RGBC reading
+        self._last_colour_buffer: list[int] = [0, 0, 0, 0]
+        self._has_colour: bool = False
         self._last_colour_hue: int = 0                  # Last colour hue (0-3600)
         self._last_colour_saturation: int = 0           # Last colour saturation (0-100)
         self._calibrated: bool = False
@@ -2253,6 +2296,7 @@ class OPT4060(SensorBase):
         self._white_reference: tuple[int, int, int, int] | None = None  # White reference RGBC values
         self._white_gains: tuple[int, int, int, int] = _DEFAULT_WHITE_GAINS # white reference gains for RGBC channels, scaled by _WHITE_CAL_SCALE
         self._job_buf: bytearray = bytearray(18 if i2c_mgr is not None else 16)
+        self._colour_work_buffer: list[int] = [0, 0, 0, 0]
         self._conversion_time: int = 0                  # Conversion time in milliseconds
 
 
@@ -2265,18 +2309,38 @@ class OPT4060(SensorBase):
     @property
     def colour(self) -> tuple[int, int, int, int] | None:
         """Return the last RGBC reading as a tuple of (R, G, B, W), or None if no reading yet."""
+        if not self._has_colour:
+            return None
+        if self._last_colour is None:
+            colour = self._last_colour_buffer
+            self._last_colour = (colour[0], colour[1], colour[2], colour[3])
         return self._last_colour
+
+
+    def colour_into(self, result: list[int]) -> list[int] | None:
+        """Copy the latest raw RGBC reading into a caller-owned buffer."""
+        if not self._has_colour:
+            return None
+        colour = self._last_colour_buffer
+        if result is not colour:
+            result[0] = colour[0]
+            result[1] = colour[1]
+            result[2] = colour[2]
+            result[3] = colour[3]
+        return result
 
 
     @property
     def colour_name(self) -> str | None:
         """Return the last colour name (from lookup), or None if no reading yet."""
-        if self._last_colour is None:
+        if not self._has_colour:
             return None
-        calibrated_colour = self.apply_white_reference(self._last_colour)
-        colour_name, hue, saturation = ColourLookup.rgbw_to_str(calibrated_colour)
-        self._last_colour_hue = hue  # Store the hue for potential future use
-        self._last_colour_saturation = saturation  # Store the saturation for potential future use
+        work_buffer = self._colour_work_buffer
+        self.apply_white_reference(self._last_colour_buffer, work_buffer)
+        ColourLookup.rgbw_to_str(work_buffer, work_buffer)
+        colour_name = ColourLookup._COLOUR_TABLE[work_buffer[0]]
+        self._last_colour_hue = work_buffer[1]
+        self._last_colour_saturation = work_buffer[2]
         return colour_name
 
 
@@ -2333,9 +2397,9 @@ class OPT4060(SensorBase):
 
 
     @black_reference.setter
-    def black_reference(self, colour: tuple[int, int, int, int]) -> None:
+    def black_reference(self, colour: tuple[int, int, int, int] | list[int]) -> None:
         """Capture the current RGBC reading as the black reference."""
-        self._black_reference = colour
+        self._black_reference = (colour[0], colour[1], colour[2], colour[3])
         print(f"D:Black reference: r={colour[0]}, g={colour[1]}, b={colour[2]}, w={colour[3]}")
 
 
@@ -2346,9 +2410,9 @@ class OPT4060(SensorBase):
 
 
     @white_reference.setter
-    def white_reference(self, colour: tuple[int, int, int, int]) -> None:
+    def white_reference(self, colour: tuple[int, int, int, int] | list[int]) -> None:
         """Capture the current RGBC reading as the white reference and compute gains."""
-        self._white_reference = colour
+        self._white_reference = (colour[0], colour[1], colour[2], colour[3])
         print(f"D:White reference: r={colour[0]}, g={colour[1]}, b={colour[2]}, w={colour[3]}")
         if self._black_reference is None:
             self._black_reference = (0, 0, 0, 0)
@@ -2357,26 +2421,31 @@ class OPT4060(SensorBase):
         print(f"D:gains: {self._white_gains}")
 
 
-    def apply_white_reference(self, colour: tuple[int, int, int, int] | None = None) -> tuple[int, int, int, int]:
+    def apply_white_reference(self, colour: tuple[int, int, int, int] | list[int] | None = None, result: list | None = None) -> tuple[int, int, int, int] | list:
         """Apply white reference gains to raw RGBC values and return adjusted RGBC tuple."""
         if colour is None:
-            colour = self._last_colour
+            if self._has_colour:
+                colour = self._last_colour_buffer
+        if result is None:
+            buffer = self.apply_white_reference(colour, self._colour_work_buffer)
+            return (buffer[0], buffer[1], buffer[2], buffer[3])
+        result[0] = self._white_channel(colour, 0)
+        result[1] = self._white_channel(colour, 1)
+        result[2] = self._white_channel(colour, 2)
+        result[3] = self._white_channel(colour, 3)
+        return result
+
+    def _white_channel(self, colour, channel):
         if colour is None:
-            return (0, 0, 0, 0)
-        r, g, b, w = colour
+            return 0
+        value = colour[channel]
         if self._white_gains is None:
-            return (r, g, b, w)
+            return value
         if self._black_reference is not None:
-            r = max(0, r - self._black_reference[0])
-            g = max(0, g - self._black_reference[1])
-            b = max(0, b - self._black_reference[2])
-            w = max(0, w - self._black_reference[3])
-        return (
-            max(0, int((r * self._white_gains[0]) + (_WHITE_CAL_SCALE // 2)) // _WHITE_CAL_SCALE),
-            max(0, int((g * self._white_gains[1]) + (_WHITE_CAL_SCALE // 2)) // _WHITE_CAL_SCALE),
-            max(0, int((b * self._white_gains[2]) + (_WHITE_CAL_SCALE // 2)) // _WHITE_CAL_SCALE),
-            max(0, int((w * self._white_gains[3]) + (_WHITE_CAL_SCALE // 2)) // _WHITE_CAL_SCALE) if w > 0 else 0,
-        )
+            value -= self._black_reference[channel]
+        if channel == 3 and value <= 0:
+            return 0
+        return max(0, _scaled_white_value(value, self._white_gains[channel]))
 
 
     def _init(self) -> bool:
@@ -2447,30 +2516,61 @@ class OPT4060(SensorBase):
         return True
 
 
+    def _on_job_data(self, _job) -> None:
+        self.read_into(self._last_colour_buffer)
+
+    def poll(self):
+        """Consume a new sample using the sensor-owned buffer."""
+        return self.read_into(self._last_colour_buffer)
+
+
+    def read_into(self, result: list[int]) -> list[int] | None:
+        """Read a new sample into a caller-owned buffer without creating a tuple."""
+        if not self._ready:
+            return None
+        try:
+            if not self._read_values():
+                return None
+        except Exception:          # pylint: disable=broad-exception-caught
+            self._report_read_error()
+            return None
+        return self.colour_into(result)
+
+
     def _read(self) -> tuple[int, int, int, int] | None:
         """Return the latest RGBW reading, or None if no new measurement is available."""
+        if not self._read_values():
+            return None
+        return self.colour
+
+
+    def _read_values(self) -> bool:
+        """Read a new sample directly into the persistent channel buffer."""
         if i2c_mgr is not None and not self._interrupts:
             if not self._job_poll(self._job_buf):
-                return None
+                return False
+            hexdiag.output(0, 1)
             st = (self._job_buf[0] << 8) | self._job_buf[1]
             data_offset = 2
+            hexdiag.output(0, 0)
         else:
             self._i2c.readfrom_mem_into(self._i2c_addr, _REG_RES_CTRL, self._i2c_buffer_2)
             st = (self._i2c_buffer_2[0] << 8) | self._i2c_buffer_2[1]
             if (st & _RES_CTRL_CONV_READY_MASK) == 0:
-                return None
+                return False
             self._i2c.readfrom_mem_into(self._i2c_addr, _REG_RED_MSB, self._job_buf)
             data_offset = 0
             self._job_sequence += 1
         self._overload = bool(st & _RES_CTRL_OVERLOAD_MASK)
 
-        r = self._decode_channel(self._job_buf, data_offset)
-        g = self._decode_channel(self._job_buf, data_offset + 4)
-        b = self._decode_channel(self._job_buf, data_offset + 8)
-        w = self._decode_channel(self._job_buf, data_offset + 12)
-
-        self._last_colour = (r, g, b, w)
-        return r, g, b, w
+        colour = self._last_colour_buffer
+        colour[0] = self._decode_channel(self._job_buf, data_offset)
+        colour[1] = self._decode_channel(self._job_buf, data_offset + 4)
+        colour[2] = self._decode_channel(self._job_buf, data_offset + 8)
+        colour[3] = self._decode_channel(self._job_buf, data_offset + 12)
+        self._last_colour = None
+        self._has_colour = True
+        return True
 
 
 #---------------------------------------------------------------------------------
